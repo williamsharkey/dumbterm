@@ -1,0 +1,23 @@
+# Binaries
+dumbterm
+dumbterm.exe
+dumbterm2.exe
+dumbterm-server
+*.o
+*.dll
+
+# Build artifacts
+*.bak
+
+# Node
+node_modules/
+package-lock.json
+
+# Go
+go.sum
+
+# Test temporaries
+test_child*.sh
+test_child*.bat
+/tmp/
+*.log
