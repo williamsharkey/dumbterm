@@ -1471,7 +1471,7 @@ static const char JS_SHIM[] =
     "var _origPush=process.stdin.push.bind(process.stdin);\n"
     "var _rBuf='';\n"
     "process.stdin.push=function(chunk,enc){\n"
-    "  if(!chunk)return _origPush(chunk,enc);\n"
+    "  if(!chunk) return _origPush(chunk,enc);\n"
     "  var s=typeof chunk==='string'?chunk:chunk.toString('binary');\n"
     "  _rBuf+=s;var out='';\n"
     "  while(_rBuf.length>0){\n"
@@ -1489,7 +1489,9 @@ static const char JS_SHIM[] =
     "    }\n"
     "    _rBuf=_rBuf.slice(end+2);\n"
     "  }\n"
-    "  if(out.length>0)_origPush(Buffer.from(out,'binary'),enc);\n"
+    "  /* must return _origPush's value — falsy triggers backpressure and stops pipe reads */\n"
+    "  if(out.length>0) return _origPush(Buffer.from(out,'binary'),enc);\n"
+    "  return true;\n"
     "};\n";
 
 static void write_shim(char *path, int cols, int rows) {
@@ -2868,13 +2870,19 @@ static void menu_cb(int item) {
 @end
 static DTMenuHandler *g_menu_handler;
 
-/* Subclass NSOpenGLView to redraw during live window resize (prevents scaling) */
+/* Subclass NSOpenGLView for jitter-free live resize.
+   Key: override setFrameSize: to render synchronously on every resize event,
+   so the compositor never gets a chance to scale the old framebuffer. */
 @interface DTGLView : NSOpenGLView
 @end
 @implementation DTGLView
-- (void)reshape {
-    [super reshape];
+- (BOOL)isOpaque { return YES; }
+- (BOOL)wantsDefaultClipping { return NO; }
+- (BOOL)inLiveResize { return [super inLiveResize]; }
+
+- (void)_dtRenderNow {
     [[self openGLContext] makeCurrentContext];
+    [[self openGLContext] update];
     NSSize pts = [self bounds].size;
     NSSize px = [self convertSizeToBacking:pts];
     glViewport(0, 0, (int)px.width, (int)px.height);
@@ -2886,6 +2894,20 @@ static DTMenuHandler *g_menu_handler;
         apply_resize(new_cols, new_rows);
     gl_render();
     [[self openGLContext] flushBuffer];
+}
+
+- (void)setFrameSize:(NSSize)newSize {
+    [super setFrameSize:newSize];
+    [self _dtRenderNow];
+}
+
+- (void)reshape {
+    [super reshape];
+    [self _dtRenderNow];
+}
+
+- (void)drawRect:(NSRect)dirtyRect {
+    [self _dtRenderNow];
 }
 @end
 #endif
@@ -3081,16 +3103,24 @@ int main(int argc, char **argv) {
         static char t[256]; snprintf(t,sizeof(t),"dumbterm [server:%s]",g_listen_addr); title=t;
     }
     [window setTitle:[NSString stringWithUTF8String:title]];
+    /* snap resizes to cell grid — eliminates sub-cell scaling jitter */
+    [window setContentResizeIncrements:NSMakeSize(CELL_W, CELL_H)];
+    [window setMinSize:NSMakeSize(10 * CELL_W, 4 * CELL_H)];
+    [window setAnimationBehavior:NSWindowAnimationBehaviorNone];
 
     /* OpenGL view */
     NSOpenGLPixelFormatAttribute attrs[] = {
-        NSOpenGLPFADoubleBuffer, NSOpenGLPFAColorSize, 24, NSOpenGLPFAAlphaSize, 8, 0
+        NSOpenGLPFADoubleBuffer, NSOpenGLPFAColorSize, 24, NSOpenGLPFAAlphaSize, 8,
+        NSOpenGLPFABackingStore, 0
     };
     NSOpenGLPixelFormat *pf = [[NSOpenGLPixelFormat alloc] initWithAttributes:attrs];
     DTGLView *glView = [[DTGLView alloc] initWithFrame:frame pixelFormat:pf];
     [glView setWantsBestResolutionOpenGLSurface:YES];
     [window setContentView:glView];
     [[glView openGLContext] makeCurrentContext];
+    /* Surface order 1 = GL surface above the view — compositor won't stretch it */
+    GLint so = 1;
+    [[glView openGLContext] setValues:&so forParameter:NSOpenGLContextParameterSurfaceOrder];
 
     /* GL setup */
     glDisable(GL_DEPTH_TEST);
@@ -3332,25 +3362,26 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* handle resize — ortho always matches window points, never stretches */
-        [[glView openGLContext] update];
-        NSSize pts = [glView bounds].size;
-        NSSize px = [glView convertSizeToBacking:pts];
-        glViewport(0, 0, (int)px.width, (int)px.height);
-        glMatrixMode(GL_PROJECTION); glLoadIdentity();
-        glOrtho(0, pts.width, pts.height, 0, -1, 1); /* 1:1 with window points */
-        glMatrixMode(GL_MODELVIEW);
-        /* update cell count when crossing FONT_W/FONT_H boundaries */
-        int new_cols = (int)pts.width / CELL_W, new_rows = (int)pts.height / CELL_H;
-        if (new_cols != term_cols || new_rows != term_rows)
-            apply_resize(new_cols, new_rows);
+        /* DTGLView handles viewport/ortho/apply_resize in setFrameSize: + reshape.
+           During live resize, skip this work — the view's overrides own rendering. */
+        if (![glView inLiveResize]) {
+            [[glView openGLContext] update];
+            NSSize pts = [glView bounds].size;
+            NSSize px = [glView convertSizeToBacking:pts];
+            glViewport(0, 0, (int)px.width, (int)px.height);
+            glMatrixMode(GL_PROJECTION); glLoadIdentity();
+            glOrtho(0, pts.width, pts.height, 0, -1, 1);
+            glMatrixMode(GL_MODELVIEW);
+            int new_cols = (int)pts.width / CELL_W, new_rows = (int)pts.height / CELL_H;
+            if (new_cols != term_cols || new_rows != term_rows)
+                apply_resize(new_cols, new_rows);
+            [[glView openGLContext] makeCurrentContext];
+            gl_render();
+            [[glView openGLContext] flushBuffer];
+        }
 
         /* trigger output sound if chars were drawn this frame */
         if (output_buf_count > 0) { gen_output_tones(); output_buf_count = 0; }
-
-        [[glView openGLContext] makeCurrentContext];
-        gl_render();
-        [glView setNeedsDisplay:YES];
     }];
 
     [NSApp run];
