@@ -65,12 +65,24 @@ static sock_t g_listen_sock = SOCK_INVALID;
 #define MAX_CSI       16
 #define HIST_LINES    5000  /* scrollback history */
 
-/* ── cursor: pulsed amber ──────────────────────────────────────── */
+/* ── cursor: phosphor blink ────────────────────────────────────── */
 #define AMBER_R 1.00f
 #define AMBER_G 0.65f
 #define AMBER_B 0.05f
-static float cursor_tick_bright; /* 1.0 at tick, decays toward 0.3 */
-static int   cursor_last_sec;    /* detect second boundary */
+/* red-amber for the always-on active cursor floor */
+#define CURSOR_FLOOR_R 0.85f
+#define CURSOR_FLOOR_G 0.25f
+#define CURSOR_FLOOR_B 0.02f
+#define CURSOR_FLOOR_A 0.05f
+/* phosphor glow: per-cell brightness left behind by blink ticks */
+#define CURSOR_PHOSPHOR_MAX 256
+static float cursor_phosphor[CURSOR_PHOSPHOR_MAX]; /* indexed by row*TERM_COLS+col, decays to 0 */
+static int   cursor_phosphor_col[CURSOR_PHOSPHOR_MAX];
+static int   cursor_phosphor_row[CURSOR_PHOSPHOR_MAX];
+static int   cursor_phosphor_count;
+/* blink state: wall-clock driven for precise timing */
+static double cursor_blink_next; /* next blink time (CFAbsoluteTime) */
+#define CURSOR_BLINK_SEC 0.4 /* seconds between blinks */
 
 /* ── morse scan-line visualization ─────────────────────────────── */
 /* Per-character sample boundaries for syncing visual sweep with audio */
@@ -173,8 +185,9 @@ static const SoundPreset PRESETS[] = {
 /* volume: 0=off, 1=lo(0.05), 2=med(0.15), 3=hi(0.35) */
 static int morse_preset = 0, morse_vol = 1;
 static int hover_preset = 3, hover_vol = 1;
-static int type_preset = 1, type_vol = 0;   /* sound when user types */
-static int output_preset = 7, output_vol = 0; /* sound when chars appear on screen */
+static int type_preset = 1, type_vol = 1;   /* sound when user types (default Lo) */
+static int delete_preset = 5, delete_vol = 1; /* sound when user deletes (default Lo) */
+static int output_preset = 7, output_vol = 1; /* sound when chars appear on screen (default Lo) */
 static int morse_speed = 0; /* 0-8: see morse speed table */
 static const float VOL_LEVELS[] = {0.0f, 0.05f, 0.15f, 0.35f};
 
@@ -191,6 +204,11 @@ static float *audio_buf;
 static int audio_len, audio_pos;
 static int audio_playing;
 static int prev_hover_col = -1, prev_hover_row = -1;
+
+/* minor pentatonic scale for box drawing tones (C5 Eb5 F5 G5 Bb5) */
+static const float BOX_SCALE[] = {523.0f, 622.0f, 698.0f, 784.0f, 932.0f};
+#define BOX_SCALE_LEN 5
+static int is_box_char(int ch) { return (ch >= 0x2500 && ch <= 0x259F); }
 
 /* simple pseudo-random for noise */
 static unsigned int rng_state = 12345;
@@ -215,13 +233,15 @@ static void gen_fm_tone(float *out, int samples, int sr, const SoundPreset *p, f
     }
 }
 
-/* generate morse audio for a string, compressed to 0.3-0.8 seconds */
-static void gen_morse_audio(const char *text, int text_len) {
+/* generate morse audio for a string of codepoints. Alphanumeric → morse,
+   box drawing → minor scale tones, other symbols → neutral tone. */
+static void gen_morse_audio(const int *text, int text_len) {
     if (morse_vol == 0) return;
     const SoundPreset *p = &PRESETS[morse_preset];
     float volume = VOL_LEVELS[morse_vol];
     int sr = 22050;
-    /* count total morse units (dot=1, dash=3, inter-element=1, inter-char=3, inter-word=7) */
+    /* count total units: morse chars get their standard units,
+       non-morse printable chars get 2 units (one tone + one gap) */
     int units = 0;
     int i;
     for (i = 0; i < text_len; i++) {
@@ -231,14 +251,15 @@ static void gen_morse_audio(const char *text, int text_len) {
         else if (ch >= 'a' && ch <= 'z') code = MORSE[ch - 'a'];
         else if (ch >= '0' && ch <= '9') code = MORSE[26 + ch - '0'];
         else if (ch == ' ') { units += 7; continue; }
+        else if (ch > ' ') { units += 2 + 3; continue; } /* tone + gap + inter-char */
         else continue;
         if (!code) continue;
         int j;
         for (j = 0; code[j]; j++) {
             units += (code[j] == '.') ? 1 : 3;
-            if (code[j+1]) units += 1; /* inter-element gap */
+            if (code[j+1]) units += 1;
         }
-        units += 3; /* inter-character gap */
+        units += 3;
     }
     if (units == 0) return;
     /* speed modes: 0-2 = max-duration capped, 3-8 = chars-per-second rate */
@@ -286,6 +307,24 @@ static void gen_morse_audio(const char *text, int text_len) {
         else if (ch >= 'a' && ch <= 'z') code = MORSE[ch - 'a'];
         else if (ch >= '0' && ch <= '9') code = MORSE[26 + ch - '0'];
         else if (ch == ' ') { pos += 7 * unit_samples; continue; }
+        else if (ch > ' ') {
+            /* non-morse printable: box drawing → minor scale, others → neutral */
+            if (idx < MORSE_VIS_MAX) morse_vis_has_sound[idx] = 1;
+            int tone_len = 2 * unit_samples;
+            if (pos + tone_len > total) tone_len = total - pos;
+            if (tone_len > 0) {
+                if (is_box_char(ch)) {
+                    int note = (ch - 0x2500) % BOX_SCALE_LEN;
+                    SoundPreset bp = {"box", BOX_SCALE[note], 11.0f, 0.6f, 0.1f, 0.88f};
+                    gen_fm_tone(audio_buf + pos, tone_len, sr, &bp, volume * 0.7f);
+                } else {
+                    SoundPreset sp = {"sym", 440.0f, 7.0f, 0.4f, 0.15f, 0.90f};
+                    gen_fm_tone(audio_buf + pos, tone_len, sr, &sp, volume * 0.5f);
+                }
+            }
+            pos += tone_len + 3 * unit_samples;
+            continue;
+        }
         else continue;
         if (!code) continue;
         if (idx < MORSE_VIS_MAX) morse_vis_has_sound[idx] = 1;
@@ -294,9 +333,9 @@ static void gen_morse_audio(const char *text, int text_len) {
             int len = (code[j] == '.') ? unit_samples : 3 * unit_samples;
             if (pos + len > total) len = total - pos;
             gen_fm_tone(audio_buf + pos, len, sr, p, volume);
-            pos += len + unit_samples; /* gap */
+            pos += len + unit_samples;
         }
-        pos += 2 * unit_samples; /* inter-char gap (already 1 from last element) */
+        pos += 2 * unit_samples;
     }
     audio_playing = 1;
 }
@@ -313,6 +352,7 @@ static void gen_hover_click(void) {
     audio_buf = (float*)calloc(len, sizeof(float));
     audio_len = len; audio_pos = 0;
     gen_fm_tone(audio_buf, len, sr, p, volume);
+    morse_vis_count = 0; /* not a morse sound — don't trigger scan-line */
     audio_playing = 1;
 }
 
@@ -326,6 +366,7 @@ static void gen_type_click(void) {
     audio_buf = (float*)calloc(len, sizeof(float));
     audio_len = len; audio_pos = 0;
     gen_fm_tone(audio_buf, len, sr, p, volume);
+    morse_vis_count = 0;
     audio_playing = 1; /* cuts off any current sound */
 }
 
@@ -338,11 +379,202 @@ static void gen_output_click(void) {
     audio_buf = (float*)calloc(len, sizeof(float));
     audio_len = len; audio_pos = 0;
     gen_fm_tone(audio_buf, len, sr, p, volume);
+    morse_vis_count = 0;
     audio_playing = 1;
 }
 
-/* throttle output sound: don't fire for every single char, batch per frame */
-static int output_chars_this_frame;
+/* faint distant plink for cursor blink — barely perceptible */
+static void gen_cursor_plink(void) {
+    /* always play — it's so quiet it won't noticeably interrupt anything */
+    float volume = 0.004f; /* barely there */
+    int sr = 22050, len = sr / 100; /* ~10ms */
+    if (audio_buf) free(audio_buf);
+    audio_buf = (float*)calloc(len, sizeof(float));
+    audio_len = len; audio_pos = 0;
+    /* ultrasonic carrier aliases hard — most energy above hearing,
+       just a felt click/presence. 10800Hz * mod_ratio 19 = sidebands at ~200kHz+ */
+    SoundPreset plink = {"plink", 10800.0f, 19.0f, 2.5f, 0.8f, 0.65f};
+    gen_fm_tone(audio_buf, len, sr, &plink, volume);
+    morse_vis_count = 0;
+    audio_playing = 1;
+}
+
+static void gen_delete_click(void) {
+    if (delete_vol == 0) return;
+    const SoundPreset *p = &PRESETS[delete_preset];
+    float volume = VOL_LEVELS[delete_vol] * 0.35f;
+    int sr = 22050, len = sr / 250; /* ~4ms — slightly longer than type click */
+    if (audio_buf) free(audio_buf);
+    audio_buf = (float*)calloc(len, sizeof(float));
+    audio_len = len; audio_pos = 0;
+    gen_fm_tone(audio_buf, len, sr, p, volume);
+    morse_vis_count = 0;
+    audio_playing = 1;
+}
+
+/* Generate reverse morse for selection deletion — plays the selected text backwards */
+static void gen_reverse_morse(const int *text, int text_len) {
+    if (morse_vol == 0) return;
+    const SoundPreset *p = &PRESETS[morse_preset];
+    float volume = VOL_LEVELS[morse_vol];
+    int sr = 22050;
+    /* count total morse units for the text */
+    int units = 0, i;
+    for (i = 0; i < text_len; i++) {
+        int ch = text[i];
+        const char *code = NULL;
+        if (ch >= 'A' && ch <= 'Z') code = MORSE[ch - 'A'];
+        else if (ch >= 'a' && ch <= 'z') code = MORSE[ch - 'a'];
+        else if (ch >= '0' && ch <= '9') code = MORSE[26 + ch - '0'];
+        else if (ch == ' ') { units += 7; continue; }
+        else if (ch > ' ') { units += 2 + 3; continue; }
+        else continue;
+        if (!code) continue;
+        int j;
+        for (j = 0; code[j]; j++) {
+            units += (code[j] == '.') ? 1 : 3;
+            if (code[j+1]) units += 1;
+        }
+        units += 3;
+    }
+    if (units == 0) return;
+    /* use super-fast speed: compress to 0.5s max */
+    float duration = 0.5f * (float)(text_len < 20 ? text_len : 20) / 20.0f;
+    if (duration > 0.5f) duration = 0.5f;
+    if (duration < 0.05f) duration = 0.05f;
+    float unit_sec = duration / (float)units;
+    int unit_samples = (int)(unit_sec * sr);
+    if (unit_samples < 1) unit_samples = 1;
+    int morse_total = units * unit_samples;
+    /* append electromechanical thunk: ~15ms low-freq FM burst */
+    int thunk_len = sr / 65; /* ~15ms */
+    int total = morse_total + thunk_len;
+    if (audio_buf) free(audio_buf);
+    audio_buf = (float*)calloc(total, sizeof(float));
+    audio_len = total; audio_pos = 0;
+    /* render morse REVERSED: iterate text backwards */
+    morse_vis_count = 0;
+    int pos = 0;
+    for (i = text_len - 1; i >= 0 && pos < total; i--) {
+        if (morse_vis_count < MORSE_VIS_MAX) {
+            morse_vis_starts[morse_vis_count] = pos;
+            morse_vis_has_sound[morse_vis_count] = 0;
+            morse_vis_count++;
+        }
+        int ch = text[i];
+        const char *code = NULL;
+        if (ch >= 'A' && ch <= 'Z') code = MORSE[ch - 'A'];
+        else if (ch >= 'a' && ch <= 'z') code = MORSE[ch - 'a'];
+        else if (ch >= '0' && ch <= '9') code = MORSE[26 + ch - '0'];
+        else if (ch == ' ') { pos += 7 * unit_samples; continue; }
+        else if (ch > ' ') {
+            if (morse_vis_count > 0) morse_vis_has_sound[morse_vis_count-1] = 1;
+            int tone_len = 2 * unit_samples;
+            if (pos + tone_len > total) tone_len = total - pos;
+            if (tone_len > 0) {
+                if (is_box_char(ch)) {
+                    int note = (ch - 0x2500) % BOX_SCALE_LEN;
+                    SoundPreset bp = {"box", BOX_SCALE[note], 11.0f, 0.6f, 0.1f, 0.88f};
+                    gen_fm_tone(audio_buf + pos, tone_len, sr, &bp, volume * 0.7f);
+                } else {
+                    SoundPreset sp2 = {"sym", 440.0f, 7.0f, 0.4f, 0.15f, 0.90f};
+                    gen_fm_tone(audio_buf + pos, tone_len, sr, &sp2, volume * 0.5f);
+                }
+            }
+            pos += tone_len + 3 * unit_samples;
+            continue;
+        }
+        else continue;
+        if (!code) continue;
+        if (morse_vis_count > 0) morse_vis_has_sound[morse_vis_count-1] = 1;
+        int j;
+        for (j = 0; code[j] && pos < total; j++) {
+            int len = (code[j] == '.') ? unit_samples : 3 * unit_samples;
+            if (pos + len > total) len = total - pos;
+            gen_fm_tone(audio_buf + pos, len, sr, p, volume);
+            pos += len + unit_samples;
+        }
+        pos += 2 * unit_samples;
+    }
+    /* electromechanical thunk: low carrier, heavy modulation, fast decay + noise burst */
+    {
+        SoundPreset thunk = {"thunk", 120.0f, 15.0f, 2.5f, 0.45f, 0.75f};
+        int tstart = morse_total;
+        if (tstart + thunk_len > total) thunk_len = total - tstart;
+        gen_fm_tone(audio_buf + tstart, thunk_len, sr, &thunk, volume * 1.2f);
+    }
+    audio_playing = 1;
+}
+
+/* ── output sonification ───────────────────────────────────────── */
+/* Track chars as they appear for tonal output + scan line visualization */
+#define OUTPUT_BUF_MAX 2048
+static int  output_buf_ch[OUTPUT_BUF_MAX];   /* codepoint */
+static int  output_buf_col[OUTPUT_BUF_MAX];  /* screen column */
+static int  output_buf_row[OUTPUT_BUF_MAX];  /* screen row */
+static int  output_buf_count;                /* chars this frame */
+
+/* deletion burn-in: stores ghost of deleted character + decay brightness */
+#define DEL_GHOST_MAX 512
+typedef struct { int col, row, ch; unsigned char fg[3]; float bright; } DelGhost;
+static DelGhost del_ghosts[DEL_GHOST_MAX];
+static int del_ghost_count;
+/* decay: 2 seconds at 60fps → 0.9917 per frame */
+#define DEL_GHOST_DECAY 0.9917f
+
+/* Generate tonal output sonification for chars that appeared this frame */
+static void gen_output_tones(void) {
+    if (output_vol == 0 || output_buf_count == 0) return;
+    if (audio_playing) return; /* don't interrupt morse or other sounds */
+    float volume = VOL_LEVELS[output_vol] * 0.15f;
+    int sr = 22050;
+    int n = output_buf_count;
+    if (n > 200) n = 200; /* cap */
+    /* duration: ~2ms per char, 0.05s min, 0.4s max */
+    float dur = (float)n * 0.002f;
+    if (dur < 0.05f) dur = 0.05f;
+    if (dur > 0.4f) dur = 0.4f;
+    int total = (int)(dur * sr);
+    if (total < 1) total = 1;
+    if (audio_buf) free(audio_buf);
+    audio_buf = (float*)calloc(total, sizeof(float));
+    audio_len = total; audio_pos = 0;
+
+    /* set up visualization */
+    morse_vis_count = n < MORSE_VIS_MAX ? n : MORSE_VIS_MAX;
+    int samples_per_char = total / n;
+    if (samples_per_char < 1) samples_per_char = 1;
+
+    int pos = 0, i;
+    for (i = 0; i < n && pos < total; i++) {
+        if (i < MORSE_VIS_MAX) {
+            morse_vis_starts[i] = pos;
+            morse_vis_cols[i] = output_buf_col[i];
+            morse_vis_rows[i] = output_buf_row[i];
+            morse_vis_has_sound[i] = 1;
+        }
+        int ch = output_buf_ch[i];
+        int tone_len = samples_per_char;
+        if (pos + tone_len > total) tone_len = total - pos;
+        if (tone_len <= 0) break;
+
+        if (is_box_char(ch)) {
+            /* box drawing: minor scale tone, pick note from codepoint */
+            int note_idx = (ch - 0x2500) % BOX_SCALE_LEN;
+            float freq = BOX_SCALE[note_idx];
+            /* generate a quick FM tone at this pitch */
+            SoundPreset bp = {"box", freq, 11.0f, 0.6f, 0.1f, 0.88f};
+            gen_fm_tone(audio_buf + pos, tone_len, sr, &bp, volume * 1.5f);
+        } else if (ch > ' ') {
+            /* regular text: soft low click */
+            SoundPreset tp = {"text", 300.0f, 5.0f, 0.3f, 0.05f, 0.92f};
+            gen_fm_tone(audio_buf + pos, tone_len, sr, &tp, volume * 0.5f);
+        }
+        pos += samples_per_char;
+    }
+    memset(morse_trail, 0, sizeof(morse_trail));
+    audio_playing = 1;
+}
 
 /* dynamic terminal size (updated on window resize) */
 static int term_cols = 120, term_rows = 40;
@@ -398,12 +630,12 @@ static int sel_contains(int c, int r) {
 
 static void sel_clear(void) { sel_mode = 0; sel_dragging = 0; }
 
-/* play morse code for current selection text, recording screen positions */
+/* play morse/tonal audio for current selection text, recording screen positions */
 static void sel_play_morse(void) {
     if (!sel_mode) return;
-    /* extract selected text + screen positions */
-    char buf[1024]; int pos = 0;
-    int scol[1024], srow[1024]; /* screen col/row for each extracted char */
+    /* extract selected codepoints + screen positions */
+    int buf[1024]; int pos = 0;
+    int scol[1024], srow[1024];
     int r0, r1, c0, c1;
     if (sel_mode == 2) {
         c0 = sel_start_col < sel_end_col ? sel_start_col : sel_end_col;
@@ -423,7 +655,7 @@ static void sel_play_morse(void) {
         int ce = (sel_mode==2) ? c1 : (r==r1 ? c1 : term_cols-1);
         for (c = cs; c <= ce && c < term_cols && pos < 1000; c++) {
             int ch = grid[r][c].ch;
-            if (ch > 0 && ch < 128) { scol[pos] = c; srow[pos] = r; buf[pos++] = (char)ch; }
+            if (ch > ' ') { scol[pos] = c; srow[pos] = r; buf[pos++] = ch; }
         }
     }
     if (pos > 0) {
@@ -439,8 +671,60 @@ static void sel_play_morse(void) {
     }
 }
 
+/* Play reverse morse for current selection (deletion sound) */
+static void sel_play_reverse_morse(void) {
+    if (!sel_mode) return;
+    int buf[1024]; int pos = 0;
+    int scol[1024], srow[1024];
+    int r0, r1, c0, c1;
+    if (sel_mode == 2) {
+        c0 = sel_start_col < sel_end_col ? sel_start_col : sel_end_col;
+        c1 = sel_start_col > sel_end_col ? sel_start_col : sel_end_col;
+        r0 = sel_start_row < sel_end_row ? sel_start_row : sel_end_row;
+        r1 = sel_start_row > sel_end_row ? sel_start_row : sel_end_row;
+    } else {
+        int s = sel_start_row * term_cols + sel_start_col;
+        int e = sel_end_row * term_cols + sel_end_col;
+        if (s > e) { int t=s; s=e; e=t; }
+        r0 = s / term_cols; c0 = s % term_cols;
+        r1 = e / term_cols; c1 = e % term_cols;
+    }
+    int r, c;
+    for (r = r0; r <= r1 && pos < 1000; r++) {
+        int cs = (sel_mode==2) ? c0 : (r==r0 ? c0 : 0);
+        int ce = (sel_mode==2) ? c1 : (r==r1 ? c1 : term_cols-1);
+        for (c = cs; c <= ce && c < term_cols && pos < 1000; c++) {
+            int ch = grid[r][c].ch;
+            if (ch > ' ') { scol[pos] = c; srow[pos] = r; buf[pos++] = ch; }
+        }
+    }
+    if (pos > 0) {
+        gen_reverse_morse(buf, pos);
+        int i;
+        for (i = 0; i < morse_vis_count && i < pos; i++) {
+            int ri = pos - 1 - i;
+            morse_vis_cols[i] = scol[ri < 0 ? 0 : ri];
+            morse_vis_rows[i] = srow[ri < 0 ? 0 : ri];
+        }
+        memset(morse_trail, 0, sizeof(morse_trail));
+        /* snapshot deleted characters as burn-in ghosts */
+        for (i = 0; i < pos && del_ghost_count < DEL_GHOST_MAX; i++) {
+            int sc = scol[i], sr2 = srow[i];
+            if (sr2 < 0 || sr2 >= TERM_ROWS || sc < 0 || sc >= TERM_COLS) continue;
+            Cell *gcl = &grid[sr2][sc];
+            if (gcl->ch <= ' ') continue;
+            DelGhost *dg = &del_ghosts[del_ghost_count++];
+            dg->col = sc; dg->row = sr2; dg->ch = gcl->ch;
+            unsigned char *gfg = gcl->inv ? gcl->bg : gcl->fg;
+            memcpy(dg->fg, gfg, 3);
+            dg->bright = 0.7f;
+        }
+    }
+}
+
 /* Smart edit: delete selected text by sending arrow keys + backspaces to child.
-   Works when selection is on the same row as the cursor (input line). */
+   Works for single-line (on cursor row) and multi-line (Claude Code input region
+   delimited by ─── horizontal rules). */
 static void sel_delete_via_keys(void (*send_fn)(const char*, int)) {
     if (!sel_mode || sel_mode == 2) return;
     int s_col = sel_start_col, s_row = sel_start_row;
@@ -448,25 +732,52 @@ static void sel_delete_via_keys(void (*send_fn)(const char*, int)) {
     if (s_row > e_row || (s_row == e_row && s_col > e_col)) {
         int t; t=s_col; s_col=e_col; e_col=t; t=s_row; s_row=e_row; e_row=t;
     }
-    /* only works for single-line selection on the cursor row */
-    if (s_row != e_row || s_row != cur_y) return;
 
-    /* trim selection to actual content — don't count empty cells past line end */
-    int last = row_last_char(s_row);
-    if (last < 0) return; /* blank line, nothing to delete */
-    if (e_col > last) e_col = last;
-    if (s_col > last) return; /* selection is entirely in empty space */
-    int sel_len = e_col - s_col + 1;
-    if (sel_len <= 0) return;
-
-    /* move cursor to end of selection (one past last selected char) */
-    int target = e_col + 1;
-    int moves = target - cur_x;
-    int i;
-    if (moves > 0) for (i = 0; i < moves; i++) send_fn("\x1b[C", 3);
-    else if (moves < 0) for (i = 0; i < -moves; i++) send_fn("\x1b[D", 3);
-    /* backspace to delete the actual content chars */
-    for (i = 0; i < sel_len; i++) send_fn("\x7f", 1);
+    if (s_row == e_row) {
+        /* single-line: must be on cursor row */
+        if (s_row != cur_y) return;
+        int last = row_last_char(s_row);
+        if (last < 0) return;
+        if (e_col > last) e_col = last;
+        if (s_col > last) return;
+        int sel_len = e_col - s_col + 1;
+        if (sel_len <= 0) return;
+        int target = e_col + 1;
+        int moves = target - cur_x;
+        int i;
+        if (moves > 0) for (i = 0; i < moves; i++) send_fn("\x1b[C", 3);
+        else if (moves < 0) for (i = 0; i < -moves; i++) send_fn("\x1b[D", 3);
+        for (i = 0; i < sel_len; i++) send_fn("\x7f", 1);
+    } else {
+        /* multi-line: cursor must be within the selection row range */
+        if (cur_y < s_row || cur_y > e_row) return;
+        /* count total content chars across all selected rows */
+        int total_chars = 0, r, c;
+        for (r = s_row; r <= e_row; r++) {
+            int cs = (r == s_row) ? s_col : 0;
+            int ce = (r == e_row) ? e_col : term_cols - 1;
+            int last = row_last_char(r);
+            if (last < 0) continue;
+            if (ce > last) ce = last;
+            if (cs > last) continue;
+            total_chars += ce - cs + 1;
+            if (r < e_row) total_chars++; /* +1 for the newline/line-join between rows */
+        }
+        if (total_chars <= 0) return;
+        /* move cursor to end of selection: go to e_row, e_col+1 */
+        int i;
+        /* first move down to e_row */
+        while (cur_y < e_row) { send_fn("\x1b[B", 3); cur_y++; }
+        while (cur_y > e_row) { send_fn("\x1b[A", 3); cur_y--; }
+        /* then move to e_col+1 */
+        int last_e = row_last_char(e_row);
+        int target = (last_e >= 0 && e_col > last_e) ? last_e + 1 : e_col + 1;
+        int moves = target - cur_x;
+        if (moves > 0) for (i = 0; i < moves; i++) send_fn("\x1b[C", 3);
+        else if (moves < 0) for (i = 0; i < -moves; i++) send_fn("\x1b[D", 3);
+        /* send backspaces — enough to delete all content + line joins */
+        for (i = 0; i < total_chars; i++) send_fn("\x7f", 1);
+    }
 }
 
 static void sel_copy(void) {
@@ -571,8 +882,14 @@ static void put_char(int ch) {
     if (cur_y >= term_rows) { grid_scroll_up(1); cur_y = term_rows-1; }
     Cell *cl = &grid[cur_y][cur_x];
     cl->ch = ch; memcpy(cl->fg, pen_fg, 3); memcpy(cl->bg, pen_bg, 3);
-    cl->bold = pen_bold; cl->inv = pen_inv; cur_x++;
-    if (ch > ' ') output_chars_this_frame++;
+    cl->bold = pen_bold; cl->inv = pen_inv;
+    if (ch > ' ' && output_buf_count < OUTPUT_BUF_MAX) {
+        output_buf_ch[output_buf_count] = ch;
+        output_buf_col[output_buf_count] = cur_x;
+        output_buf_row[output_buf_count] = cur_y;
+        output_buf_count++;
+    }
+    cur_x++;
 }
 
 static void erase_line(int mode) {
@@ -829,13 +1146,50 @@ static void net_broadcast(const char *data, int len) {
     }
 }
 
+/* Filter _RESIZE sequences from network input, forward the rest.
+   Scans buf for ESC _ RESIZE;cols;rows ESC \ and calls resize_fn on match.
+   Returns filtered buffer with _RESIZE removed, forwarding the rest to send_fn. */
+static void net_filter_and_forward(const unsigned char *buf, int len,
+    void (*send_fn)(const char*, int),
+    void (*resize_fn)(int cols, int rows))
+{
+    int i = 0, flush_from = 0;
+    while (i < len) {
+        if (buf[i] == 0x1b && i+1 < len && buf[i+1] == '_') {
+            /* possible APC sequence — look for RESIZE;cols;rows ESC \ */
+            int j = i + 2;
+            if (j + 7 <= len && memcmp(buf+j, "RESIZE;", 7) == 0) {
+                j += 7;
+                int cols = 0, rows = 0;
+                while (j < len && buf[j] >= '0' && buf[j] <= '9') cols = cols*10 + (buf[j++]-'0');
+                if (j < len && buf[j] == ';') j++;
+                while (j < len && buf[j] >= '0' && buf[j] <= '9') rows = rows*10 + (buf[j++]-'0');
+                /* expect ESC \ as terminator */
+                if (j+1 < len && buf[j] == 0x1b && buf[j+1] == '\\') {
+                    j += 2;
+                    /* flush bytes before this sequence */
+                    if (i > flush_from) send_fn((char*)buf+flush_from, i-flush_from);
+                    /* handle resize */
+                    if (cols > 0 && rows > 0 && resize_fn) resize_fn(cols, rows);
+                    flush_from = j;
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        i++;
+    }
+    /* flush remaining */
+    if (flush_from < len) send_fn((char*)buf+flush_from, len-flush_from);
+}
+
 /* Read input from all clients, merge into one stream */
-static void net_read_all_clients(void (*send_fn)(const char*, int)) {
+static void net_read_all_clients(void (*send_fn)(const char*, int), void (*resize_fn)(int, int)) {
     unsigned char buf[4096];
     int i;
     for (i = 0; i < g_num_clients; i++) {
         int n = recv(g_clients[i], (char*)buf, sizeof(buf), 0);
-        if (n > 0) send_fn((char*)buf, n);
+        if (n > 0) net_filter_and_forward(buf, n, send_fn, resize_fn);
         else if (n == 0) {
             fprintf(stderr, "dumbterm: client %d disconnected\n", i+1);
             sock_close(g_clients[i]);
@@ -937,6 +1291,7 @@ static int win_w, win_h;
 /* Atlas texture data (built before GL context) */
 static unsigned char *g_atlas;
 static int g_atlas_w, g_atlas_h, g_acols;
+static int g_wide_y_offset, g_wide_acols;
 
 static void platform_gl_init(void);
 static void platform_spawn(const char *cmd);
@@ -947,23 +1302,35 @@ static void gl_render(void);
 static void build_atlas(void) {
     g_acols = 32;
     int arows = (UNIFONT_COUNT + g_acols - 1) / g_acols;
-    g_atlas_w = g_acols * FONT_W;
-    g_atlas_h = arows * FONT_H;
+    g_wide_acols = 16;
+    int wide_arows = (UNIFONT_WIDE_COUNT + g_wide_acols - 1) / g_wide_acols;
+    int narrow_w = g_acols * FONT_W;
+    int wide_w = g_wide_acols * FONT_W * 2;
+    g_atlas_w = narrow_w > wide_w ? narrow_w : wide_w;
+    g_wide_y_offset = arows * FONT_H;
+    g_atlas_h = g_wide_y_offset + wide_arows * FONT_H;
     g_atlas = (unsigned char *)calloc(g_atlas_w * g_atlas_h, 1);
-    int i;
+    int i, y, x;
     for (i = 0; i < UNIFONT_COUNT; i++) {
         int gx = (i % g_acols) * FONT_W;
         int gy = (i / g_acols) * FONT_H;
-        int y, x;
         for (y = 0; y < FONT_H; y++) {
             unsigned char row = UNIFONT[i].data[y];
             for (x = 0; x < FONT_W; x++)
                 if (row & (0x80 >> x)) g_atlas[(gy+y)*g_atlas_w + gx+x] = 255;
         }
     }
+    for (i = 0; i < UNIFONT_WIDE_COUNT; i++) {
+        int gx = (i % g_wide_acols) * FONT_W * 2;
+        int gy = g_wide_y_offset + (i / g_wide_acols) * FONT_H;
+        for (y = 0; y < FONT_H; y++) {
+            unsigned short row = ((unsigned short)UNIFONT_WIDE[i].data[y*2] << 8) | UNIFONT_WIDE[i].data[y*2+1];
+            for (x = 0; x < 16; x++)
+                if (row & (0x8000 >> x)) g_atlas[(gy+y)*g_atlas_w + gx+x] = 255;
+        }
+    }
 }
 
-/* Glyph index lookup (binary search UNIFONT by codepoint, return index) */
 static int glyph_index(unsigned short cp) {
     int lo = 0, hi = UNIFONT_COUNT - 1;
     while (lo <= hi) {
@@ -971,8 +1338,17 @@ static int glyph_index(unsigned short cp) {
         if (UNIFONT[mid].cp == cp) return mid;
         if (UNIFONT[mid].cp < cp) lo = mid + 1; else hi = mid - 1;
     }
-    /* fallback to '?' */
     return glyph_index('?');
+}
+
+static int glyph_wide_index(unsigned short cp) {
+    int lo = 0, hi = UNIFONT_WIDE_COUNT - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (UNIFONT_WIDE[mid].cp == cp) return mid;
+        if (UNIFONT_WIDE[mid].cp < cp) lo = mid + 1; else hi = mid - 1;
+    }
+    return -1;
 }
 
 static void platform_gl_init(void) {
@@ -1031,16 +1407,33 @@ static void gl_render(void) {
             glColor3ub(br>255?255:br, bg2>255?255:bg2, bb>255?255:bb);
         } else glColor3ub(fg[0],fg[1],fg[2]);
 
-        int gi = glyph_index(cl->ch);
         float x0=c*FONT_W, y0=r*FONT_H, x1=x0+FONT_W, y1=y0+FONT_H;
-        float u0=(float)((gi%g_acols)*FONT_W)/(float)g_atlas_w;
-        float v0=(float)((gi/g_acols)*FONT_H)/(float)g_atlas_h;
-        float u1=u0+(float)FONT_W/(float)g_atlas_w;
-        float v1=v0+(float)FONT_H/(float)g_atlas_h;
-        glTexCoord2f(u0,v0); glVertex2f(x0,y0);
-        glTexCoord2f(u1,v0); glVertex2f(x1,y0);
-        glTexCoord2f(u1,v1); glVertex2f(x1,y1);
-        glTexCoord2f(u0,v1); glVertex2f(x0,y1);
+        float u0, v0, u1, v1;
+        int wi = glyph_wide_index(cl->ch);
+        if (wi >= 0) {
+            u0 = (float)((wi % g_wide_acols) * FONT_W * 2) / (float)g_atlas_w;
+            v0 = (float)(g_wide_y_offset + (wi / g_wide_acols) * FONT_H) / (float)g_atlas_h;
+            u1 = u0 + (float)(FONT_W * 2) / (float)g_atlas_w;
+            v1 = v0 + (float)FONT_H / (float)g_atlas_h;
+        } else {
+            int gi = glyph_index(cl->ch);
+            u0 = (float)((gi % g_acols) * FONT_W) / (float)g_atlas_w;
+            v0 = (float)((gi / g_acols) * FONT_H) / (float)g_atlas_h;
+            u1 = u0 + (float)FONT_W / (float)g_atlas_w;
+            v1 = v0 + (float)FONT_H / (float)g_atlas_h;
+        }
+        if (wi >= 0) {
+            float pad = (float)(FONT_H - FONT_W) * 0.5f;
+            glTexCoord2f(u0,v0); glVertex2f(x0, y0+pad);
+            glTexCoord2f(u1,v0); glVertex2f(x1, y0+pad);
+            glTexCoord2f(u1,v1); glVertex2f(x1, y0+pad+FONT_W);
+            glTexCoord2f(u0,v1); glVertex2f(x0, y0+pad+FONT_W);
+        } else {
+            glTexCoord2f(u0,v0); glVertex2f(x0,y0);
+            glTexCoord2f(u1,v0); glVertex2f(x1,y0);
+            glTexCoord2f(u1,v1); glVertex2f(x1,y1);
+            glTexCoord2f(u0,v1); glVertex2f(x0,y1);
+        }
     }
     glEnd();
 }
@@ -1073,7 +1466,31 @@ static const char JS_SHIM[] =
     "process.env.SHELL=process.env.SHELL||'C:\\\\Program Files\\\\Git\\\\usr\\\\bin\\\\bash.exe';\n"
     "var tty=require('tty');\n"
     "process.stdout.__proto__=tty.WriteStream.prototype;\n"
-    "process.stderr.__proto__=tty.WriteStream.prototype;\n";
+    "process.stderr.__proto__=tty.WriteStream.prototype;\n"
+    /* Intercept _RESIZE on stdin: ESC _ RESIZE;cols;rows ESC \ */
+    "var _origPush=process.stdin.push.bind(process.stdin);\n"
+    "var _rBuf='';\n"
+    "process.stdin.push=function(chunk,enc){\n"
+    "  if(!chunk)return _origPush(chunk,enc);\n"
+    "  var s=typeof chunk==='string'?chunk:chunk.toString('binary');\n"
+    "  _rBuf+=s;var out='';\n"
+    "  while(_rBuf.length>0){\n"
+    "    var idx=_rBuf.indexOf('\\x1b_RESIZE;');\n"
+    "    if(idx<0){out+=_rBuf;_rBuf='';break;}\n"
+    "    out+=_rBuf.slice(0,idx);\n"
+    "    var end=_rBuf.indexOf('\\x1b\\\\',idx+9);\n"
+    "    if(end<0){_rBuf=_rBuf.slice(idx);break;}\n"
+    "    var parts=_rBuf.slice(idx+9,end).split(';');\n"
+    "    var nc=parseInt(parts[0]),nr=parseInt(parts[1]);\n"
+    "    if(nc>0&&nr>0){\n"
+    "      process.stdout.columns=nc;process.stdout.rows=nr;\n"
+    "      process.stderr.columns=nc;process.stderr.rows=nr;\n"
+    "      process.stdout.emit('resize');process.stderr.emit('resize');\n"
+    "    }\n"
+    "    _rBuf=_rBuf.slice(end+2);\n"
+    "  }\n"
+    "  if(out.length>0)_origPush(Buffer.from(out,'binary'),enc);\n"
+    "};\n";
 
 static void write_shim(char *path, int cols, int rows) {
     GetModuleFileNameA(NULL, path, MAX_PATH);
@@ -1188,6 +1605,23 @@ static void handle_key(WPARAM vk, int ctrl) {
     }
 }
 
+static void apply_resize(int new_cols, int new_rows) {
+    if (new_cols == term_cols && new_rows == term_rows) return;
+    if (new_cols < 10) new_cols = 10; if (new_rows < 4) new_rows = 4;
+    if (new_cols > TERM_COLS) new_cols = TERM_COLS;
+    if (new_rows > TERM_ROWS) new_rows = TERM_ROWS;
+    term_cols = new_cols; term_rows = new_rows;
+    int r, c;
+    for (r = 0; r < TERM_ROWS; r++)
+        for (c = 0; c < TERM_COLS; c++) {
+            grid[r][c].ch = ' '; grid[r][c].bg[0]=grid[r][c].bg[1]=grid[r][c].bg[2]=0;
+            grid[r][c].fg[0]=grid[r][c].fg[1]=grid[r][c].fg[2]=192; grid[r][c].inv=grid[r][c].bold=0;
+        }
+    cur_x = 0; cur_y = 0;
+    scroll_y = 0; scroll_vel = 0; scroll_snapping = 0; scroll_locked = 1;
+    hist_count = 0; hist_write = 0;
+}
+
 static void send_char(char c) {
     if (g_net_mode == 2) net_write(g_net_sock, &c, 1);
     else platform_write_child(&c, 1);
@@ -1208,6 +1642,19 @@ static LRESULT CALLBACK wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcA(hwnd, msg, wp, lp);
 }
 
+/* Send _RESIZE to child stdin (Windows pipes — child JS shim intercepts it) */
+static void win_send_resize_to_child(int cols, int rows) {
+    char msg[64];
+    int len = sprintf(msg, "\x1b_RESIZE;%d;%d\x1b\\", cols, rows);
+    DWORD written;
+    WriteFile(child_stdin_wr, msg, len, &written, NULL);
+    apply_resize(cols, rows);
+}
+
+static void win_headless_fwd(const char *data, int len) {
+    DWORD written; WriteFile(child_stdin_wr, data, len, &written, NULL);
+}
+
 /* Win32 server mode: headless, forward child pipe bytes over network */
 static int win_run_server(const char *addr, const char *child_cmd) {
     if (net_serve(addr, child_cmd) != 0) return 1;
@@ -1225,7 +1672,7 @@ static int win_run_server(const char *addr, const char *child_cmd) {
                 send(g_net_sock, (char*)buf, nr, 0);
         }
         int n = recv(g_net_sock, (char*)buf, sizeof(buf), 0);
-        if (n > 0) { DWORD written; WriteFile(child_stdin_wr, buf, n, &written, NULL); }
+        if (n > 0) net_filter_and_forward(buf, n, win_headless_fwd, win_send_resize_to_child);
         else if (n == 0) break;
         DWORD code;
         if (GetExitCodeProcess(child_proc, &code) && code != STILL_ACTIVE) {
@@ -1315,7 +1762,7 @@ int main(int argc, char **argv) {
             }
             if (g_net_mode == 1 && g_server_visible) {
                 net_accept_clients();
-                net_read_all_clients(platform_write_child);
+                net_read_all_clients(platform_write_child, win_send_resize_to_child);
             }
         }
         gl_render(); SwapBuffers(g_hdc); Sleep(1);
@@ -1398,22 +1845,41 @@ static int child_alive;
 static int g_acols;
 static int g_atlas_w, g_atlas_h;
 static unsigned char *g_atlas;
+static int g_wide_y_offset; /* Y pixel offset in atlas where wide glyphs start */
+static int g_wide_acols;    /* columns in the wide section (16px each) */
 
 static void build_atlas(void) {
     g_acols = 32;
     int arows = (UNIFONT_COUNT + g_acols - 1) / g_acols;
-    g_atlas_w = g_acols * FONT_W;
-    g_atlas_h = arows * FONT_H;
+    /* wide glyphs: 16px wide, so fewer per row */
+    g_wide_acols = 16; /* 16 wide glyphs per row */
+    int wide_arows = (UNIFONT_WIDE_COUNT + g_wide_acols - 1) / g_wide_acols;
+    /* atlas width must fit both: narrow needs g_acols*8, wide needs g_wide_acols*16 */
+    int narrow_w = g_acols * FONT_W;      /* 32*8 = 256 */
+    int wide_w = g_wide_acols * FONT_W*2; /* 16*16 = 256 */
+    g_atlas_w = narrow_w > wide_w ? narrow_w : wide_w;
+    g_wide_y_offset = arows * FONT_H;
+    g_atlas_h = g_wide_y_offset + wide_arows * FONT_H;
     g_atlas = (unsigned char *)calloc(g_atlas_w * g_atlas_h, 1);
-    int i;
+    int i, y, x;
+    /* narrow glyphs: 8px wide */
     for (i = 0; i < UNIFONT_COUNT; i++) {
         int gx = (i % g_acols) * FONT_W;
         int gy = (i / g_acols) * FONT_H;
-        int y, x;
         for (y = 0; y < FONT_H; y++) {
             unsigned char row = UNIFONT[i].data[y];
             for (x = 0; x < FONT_W; x++)
                 if (row & (0x80 >> x)) g_atlas[(gy+y)*g_atlas_w + gx+x] = 255;
+        }
+    }
+    /* wide glyphs: 16px wide */
+    for (i = 0; i < UNIFONT_WIDE_COUNT; i++) {
+        int gx = (i % g_wide_acols) * FONT_W * 2;
+        int gy = g_wide_y_offset + (i / g_wide_acols) * FONT_H;
+        for (y = 0; y < FONT_H; y++) {
+            unsigned short row = ((unsigned short)UNIFONT_WIDE[i].data[y*2] << 8) | UNIFONT_WIDE[i].data[y*2+1];
+            for (x = 0; x < 16; x++)
+                if (row & (0x8000 >> x)) g_atlas[(gy+y)*g_atlas_w + gx+x] = 255;
         }
     }
 }
@@ -1426,6 +1892,17 @@ static int glyph_index(unsigned short cp) {
         if (UNIFONT[mid].cp < cp) lo = mid + 1; else hi = mid - 1;
     }
     return glyph_index('?');
+}
+
+/* returns wide glyph index or -1 */
+static int glyph_wide_index(unsigned short cp) {
+    int lo = 0, hi = UNIFONT_WIDE_COUNT - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (UNIFONT_WIDE[mid].cp == cp) return mid;
+        if (UNIFONT_WIDE[mid].cp < cp) lo = mid + 1; else hi = mid - 1;
+    }
+    return -1;
 }
 
 /* Get a cell from either history or the live grid.
@@ -1460,21 +1937,40 @@ static void draw_cell(const Cell *cl, float x, float y, float g) {
         glEnd();
     }
     if (cl->ch != ' ' && cl->ch != 0) {
-        int gi = glyph_index(cl->ch);
-        float u0=(float)((gi%g_acols)*FONT_W)/(float)g_atlas_w;
-        float v0=(float)((gi/g_acols)*FONT_H)/(float)g_atlas_h;
-        float u1=u0+(float)FONT_W/(float)g_atlas_w;
-        float v1=v0+(float)FONT_H/(float)g_atlas_h;
+        float u0, v0, u1, v1;
+        int wi = glyph_wide_index(cl->ch);
+        if (wi >= 0) {
+            /* wide glyph: 16px in atlas, rendered scaled down into CELL_W */
+            u0 = (float)((wi % g_wide_acols) * FONT_W * 2) / (float)g_atlas_w;
+            v0 = (float)(g_wide_y_offset + (wi / g_wide_acols) * FONT_H) / (float)g_atlas_h;
+            u1 = u0 + (float)(FONT_W * 2) / (float)g_atlas_w;
+            v1 = v0 + (float)FONT_H / (float)g_atlas_h;
+        } else {
+            int gi = glyph_index(cl->ch);
+            u0 = (float)((gi % g_acols) * FONT_W) / (float)g_atlas_w;
+            v0 = (float)((gi / g_acols) * FONT_H) / (float)g_atlas_h;
+            u1 = u0 + (float)FONT_W / (float)g_atlas_w;
+            v1 = v0 + (float)FONT_H / (float)g_atlas_h;
+        }
         glEnable(GL_TEXTURE_2D);
         glBindTexture(GL_TEXTURE_2D, gl_font_tex);
         int fr=fg[0], fgr=fg[1], fb=fg[2];
         if (cl->bold) { fr+=63; fgr+=63; fb+=63; }
         glColor3ub(glow_color(fr>255?255:fr,g), glow_color(fgr>255?255:fgr,g), glow_color(fb>255?255:fb,g));
         glBegin(GL_QUADS);
-        glTexCoord2f(u0,v0); glVertex2f(x,y);
-        glTexCoord2f(u1,v0); glVertex2f(x+CELL_W,y);
-        glTexCoord2f(u1,v1); glVertex2f(x+CELL_W,y+CELL_H);
-        glTexCoord2f(u0,v1); glVertex2f(x,y+CELL_H);
+        if (wi >= 0) {
+            /* 16x16 source → CELL_W x CELL_W square, centered vertically */
+            float pad = (float)(CELL_H - CELL_W) * 0.5f;
+            glTexCoord2f(u0,v0); glVertex2f(x, y+pad);
+            glTexCoord2f(u1,v0); glVertex2f(x+CELL_W, y+pad);
+            glTexCoord2f(u1,v1); glVertex2f(x+CELL_W, y+pad+CELL_W);
+            glTexCoord2f(u0,v1); glVertex2f(x, y+pad+CELL_W);
+        } else {
+            glTexCoord2f(u0,v0); glVertex2f(x,y);
+            glTexCoord2f(u1,v0); glVertex2f(x+CELL_W,y);
+            glTexCoord2f(u1,v1); glVertex2f(x+CELL_W,y+CELL_H);
+            glTexCoord2f(u0,v1); glVertex2f(x,y+CELL_H);
+        }
         glEnd();
     }
 }
@@ -1578,32 +2074,26 @@ static void gl_render(void) {
         }
     }
 
-    /* crosshair: 1px inner borders on highlighted row/col (additive blend) */
+    /* crosshair: full row/col amber fill with decay */
     glDisable(GL_TEXTURE_2D);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE);
     float vw = (float)(term_cols * CELL_W), vh = (float)(term_rows * CELL_H);
     for (r = 0; r < term_rows; r++) {
         if (row_glow[r] < 0.01f) continue;
-        float a = row_glow[r] * CROSS_BRIGHT;
+        float a = row_glow[r] * 0.10f;
         float ry = (float)(r * CELL_H);
-        glColor4f(1,1,1,a);
+        glColor4f(AMBER_R, AMBER_G, AMBER_B, a);
         glBegin(GL_QUADS);
-        /* top border */
-        glVertex2f(0,ry); glVertex2f(vw,ry); glVertex2f(vw,ry+1); glVertex2f(0,ry+1);
-        /* bottom border */
-        glVertex2f(0,ry+CELL_H-1); glVertex2f(vw,ry+CELL_H-1); glVertex2f(vw,ry+CELL_H); glVertex2f(0,ry+CELL_H);
+        glVertex2f(0,ry); glVertex2f(vw,ry); glVertex2f(vw,ry+CELL_H); glVertex2f(0,ry+CELL_H);
         glEnd();
     }
     for (c = 0; c < term_cols; c++) {
         if (col_glow[c] < 0.01f) continue;
-        float a = col_glow[c] * CROSS_BRIGHT;
+        float a = col_glow[c] * 0.10f;
         float cx = (float)(c * CELL_W);
-        glColor4f(1,1,1,a);
+        glColor4f(AMBER_R, AMBER_G, AMBER_B, a);
         glBegin(GL_QUADS);
-        /* left border */
-        glVertex2f(cx,0); glVertex2f(cx+1,0); glVertex2f(cx+1,vh); glVertex2f(cx,vh);
-        /* right border */
-        glVertex2f(cx+CELL_W-1,0); glVertex2f(cx+CELL_W,0); glVertex2f(cx+CELL_W,vh); glVertex2f(cx+CELL_W-1,vh);
+        glVertex2f(cx,0); glVertex2f(cx+CELL_W,0); glVertex2f(cx+CELL_W,vh); glVertex2f(cx,vh);
         glEnd();
     }
     /* selection: two-layer amber fill + perimeter border */
@@ -1669,24 +2159,19 @@ static void gl_render(void) {
         glEnd();
     }
 
-    /* ── pulsed amber cursor ─────────────────────────────────────── */
+    /* ── phosphor-blink cursor ──────────────────────────────────── */
     glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     {
-        time_t now_t = time(NULL);
-        int cur_sec = (int)(now_t % 60);
-        if (cur_sec != cursor_last_sec) { cursor_tick_bright = 1.0f; cursor_last_sec = cur_sec; }
-        cursor_tick_bright = 0.3f + (cursor_tick_bright - 0.3f) * 0.96f;
-
-        int cur_px = -1, cur_py = -1;
-        unsigned char cbg[3] = {0,0,0};
+        /* find cursor cell: .inv scan or cur_vis fallback */
+        int cur_col = -1, cur_row = -1;
         int cur_ch_code = 0;
-        unsigned char cur_fg[3] = {0,0,0};
+        unsigned char cbg[3] = {0,0,0}, cur_fg[3] = {0,0,0};
 
         if (scroll_y < 1.0f) {
             for (r = 0; r < term_rows; r++) {
                 for (c = 0; c < term_cols; c++) {
                     if (grid[r][c].inv) {
-                        cur_px = c * CELL_W; cur_py = r * CELL_H;
+                        cur_col = c; cur_row = r;
                         memcpy(cbg, grid[r][c].bg, 3);
                         cur_ch_code = grid[r][c].ch;
                         memcpy(cur_fg, grid[r][c].bg, 3);
@@ -1695,7 +2180,7 @@ static void gl_render(void) {
                 }
             }
             if (cur_vis && cur_x < term_cols && cur_y < term_rows) {
-                cur_px = cur_x * CELL_W; cur_py = cur_y * CELL_H;
+                cur_col = cur_x; cur_row = cur_y;
                 memcpy(cbg, grid[cur_y][cur_x].bg, 3);
                 cur_ch_code = grid[cur_y][cur_x].ch;
                 memcpy(cur_fg, grid[cur_y][cur_x].fg, 3);
@@ -1703,36 +2188,95 @@ static void gl_render(void) {
         }
         found_cursor:
 
-        if (cur_px >= 0) {
-            float ix = (float)cur_px, iy = (float)cur_py;
-            float b = cursor_tick_bright;
-            float bgr = AMBER_R * b + (float)cbg[0]/255.0f * (1.0f-b);
-            float bgg = AMBER_G * b + (float)cbg[1]/255.0f * (1.0f-b);
-            float bgb = AMBER_B * b + (float)cbg[2]/255.0f * (1.0f-b);
+        /* blink tick: wall-clock driven */
+        double now_time = CFAbsoluteTimeGetCurrent();
+        if (cursor_blink_next == 0) cursor_blink_next = now_time + CURSOR_BLINK_SEC;
+        if (now_time >= cursor_blink_next) {
+            cursor_blink_next += CURSOR_BLINK_SEC;
+            /* if we fell behind by more than one interval, resync */
+            if (cursor_blink_next < now_time) cursor_blink_next = now_time + CURSOR_BLINK_SEC;
+            /* stamp phosphor at current cursor position */
+            if (cur_col >= 0) {
+                /* check if this cell already has a phosphor entry */
+                int found = -1, pi;
+                for (pi = 0; pi < cursor_phosphor_count; pi++) {
+                    if (cursor_phosphor_col[pi] == cur_col && cursor_phosphor_row[pi] == cur_row)
+                        { found = pi; break; }
+                }
+                if (found >= 0) {
+                    cursor_phosphor[found] = 1.0f;
+                } else if (cursor_phosphor_count < CURSOR_PHOSPHOR_MAX) {
+                    int idx = cursor_phosphor_count++;
+                    cursor_phosphor[idx] = 1.0f;
+                    cursor_phosphor_col[idx] = cur_col;
+                    cursor_phosphor_row[idx] = cur_row;
+                }
+                gen_cursor_plink();
+            }
+        }
 
+        /* decay all phosphor entries and draw them */
+        glDisable(GL_TEXTURE_2D);
+        {
+            int pi;
+            for (pi = 0; pi < cursor_phosphor_count; pi++) {
+                /* two-phase decay: fast above 0.15, very slow below —
+                   the last embers linger like CRT phosphor cooling */
+                float p = cursor_phosphor[pi];
+                if (p > 0.15f) p *= 0.96f;       /* fast initial drop */
+                else            p *= 0.993f;      /* long tail: ~10 seconds to black */
+                cursor_phosphor[pi] = p;
+                if (p < 0.002f) {
+                    cursor_phosphor[pi] = cursor_phosphor[--cursor_phosphor_count];
+                    cursor_phosphor_col[pi] = cursor_phosphor_col[cursor_phosphor_count];
+                    cursor_phosphor_row[pi] = cursor_phosphor_row[cursor_phosphor_count];
+                    pi--; continue;
+                }
+                float px = (float)(cursor_phosphor_col[pi] * CELL_W);
+                float py = (float)(cursor_phosphor_row[pi] * CELL_H);
+                float b = p;
+                float pr = AMBER_R * b + (float)cbg[0]/255.0f * (1.0f-b);
+                float pg = AMBER_G * b + (float)cbg[1]/255.0f * (1.0f-b);
+                float pb = AMBER_B * b + (float)cbg[2]/255.0f * (1.0f-b);
+                glColor4f(pr, pg, pb, 1.0f);
+                glBegin(GL_QUADS);
+                glVertex2f(px,py); glVertex2f(px+CELL_W,py);
+                glVertex2f(px+CELL_W,py+CELL_H); glVertex2f(px,py+CELL_H);
+                glEnd();
+                /* redraw glyph if present */
+                Cell *pcl = &grid[cursor_phosphor_row[pi]][cursor_phosphor_col[pi]];
+                if (pcl->ch != ' ' && pcl->ch != 0) {
+                    int gi = glyph_index(pcl->ch);
+                    float u0=(float)((gi%g_acols)*FONT_W)/(float)g_atlas_w;
+                    float v0=(float)((gi/g_acols)*FONT_H)/(float)g_atlas_h;
+                    float u1=u0+(float)FONT_W/(float)g_atlas_w;
+                    float v1=v0+(float)FONT_H/(float)g_atlas_h;
+                    glEnable(GL_TEXTURE_2D);
+                    glBindTexture(GL_TEXTURE_2D, gl_font_tex);
+                    unsigned char *fg = pcl->inv ? pcl->bg : pcl->fg;
+                    glColor3ub(fg[0], fg[1], fg[2]);
+                    glBegin(GL_QUADS);
+                    glTexCoord2f(u0,v0); glVertex2f(px,py);
+                    glTexCoord2f(u1,v0); glVertex2f(px+CELL_W,py);
+                    glTexCoord2f(u1,v1); glVertex2f(px+CELL_W,py+CELL_H);
+                    glTexCoord2f(u0,v1); glVertex2f(px,py+CELL_H);
+                    glEnd();
+                    glDisable(GL_TEXTURE_2D);
+                }
+            }
+        }
+
+        /* active cursor: red-amber floor at current position */
+        if (cur_col >= 0) {
+            float ix = (float)(cur_col * CELL_W), iy = (float)(cur_row * CELL_H);
             glDisable(GL_TEXTURE_2D);
-            glColor4f(bgr, bgg, bgb, 1.0f);
+            glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+            glColor4f(CURSOR_FLOOR_R, CURSOR_FLOOR_G, CURSOR_FLOOR_B, CURSOR_FLOOR_A);
             glBegin(GL_QUADS);
             glVertex2f(ix,iy); glVertex2f(ix+CELL_W,iy);
             glVertex2f(ix+CELL_W,iy+CELL_H); glVertex2f(ix,iy+CELL_H);
             glEnd();
-
-            if (cur_ch_code != ' ' && cur_ch_code != 0) {
-                int gi = glyph_index(cur_ch_code);
-                float u0=(float)((gi%g_acols)*FONT_W)/(float)g_atlas_w;
-                float v0=(float)((gi/g_acols)*FONT_H)/(float)g_atlas_h;
-                float u1=u0+(float)FONT_W/(float)g_atlas_w;
-                float v1=v0+(float)FONT_H/(float)g_atlas_h;
-                glEnable(GL_TEXTURE_2D);
-                glBindTexture(GL_TEXTURE_2D, gl_font_tex);
-                glColor3ub(cur_fg[0], cur_fg[1], cur_fg[2]);
-                glBegin(GL_QUADS);
-                glTexCoord2f(u0,v0); glVertex2f(ix,iy);
-                glTexCoord2f(u1,v0); glVertex2f(ix+CELL_W,iy);
-                glTexCoord2f(u1,v1); glVertex2f(ix+CELL_W,iy+CELL_H);
-                glTexCoord2f(u0,v1); glVertex2f(ix,iy+CELL_H);
-                glEnd();
-            }
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
         }
     }
 
@@ -1805,6 +2349,49 @@ static void gl_render(void) {
         glEnd();
     }
 
+    /* deletion burn-in: fading ghost glyphs where characters were deleted */
+    {
+        int di;
+        for (di = 0; di < del_ghost_count; di++) {
+            DelGhost *dg = &del_ghosts[di];
+            dg->bright *= DEL_GHOST_DECAY;
+            if (dg->bright < 0.005f) {
+                del_ghosts[di] = del_ghosts[--del_ghost_count];
+                di--; continue;
+            }
+            float gx = (float)(dg->col * CELL_W), gy = (float)(dg->row * CELL_H);
+            float b = dg->bright;
+            /* amber background glow */
+            glDisable(GL_TEXTURE_2D);
+            glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+            glColor4f(AMBER_R, AMBER_G, AMBER_B, b * 0.2f);
+            glBegin(GL_QUADS);
+            glVertex2f(gx,gy); glVertex2f(gx+CELL_W,gy);
+            glVertex2f(gx+CELL_W,gy+CELL_H); glVertex2f(gx,gy+CELL_H);
+            glEnd();
+            /* ghost glyph */
+            if (dg->ch > ' ') {
+                int gi = glyph_index(dg->ch);
+                float u0=(float)((gi%g_acols)*FONT_W)/(float)g_atlas_w;
+                float v0=(float)((gi/g_acols)*FONT_H)/(float)g_atlas_h;
+                float u1=u0+(float)FONT_W/(float)g_atlas_w;
+                float v1=v0+(float)FONT_H/(float)g_atlas_h;
+                glEnable(GL_TEXTURE_2D);
+                glBindTexture(GL_TEXTURE_2D, gl_font_tex);
+                glBlendFunc(GL_SRC_ALPHA, GL_ONE);
+                glColor4f((float)dg->fg[0]/255.0f, (float)dg->fg[1]/255.0f,
+                          (float)dg->fg[2]/255.0f, b * 0.6f);
+                glBegin(GL_QUADS);
+                glTexCoord2f(u0,v0); glVertex2f(gx,gy);
+                glTexCoord2f(u1,v0); glVertex2f(gx+CELL_W,gy);
+                glTexCoord2f(u1,v1); glVertex2f(gx+CELL_W,gy+CELL_H);
+                glTexCoord2f(u0,v1); glVertex2f(gx,gy+CELL_H);
+                glEnd();
+            }
+        }
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    }
+
     [[NSOpenGLContext currentContext] flushBuffer];
 }
 
@@ -1837,6 +2424,11 @@ static void platform_read_child(void) {
 
 static void platform_write_child(const char *data, int len) {
     if (pty_master >= 0) write(pty_master, data, len);
+}
+
+/* resize callback for remote clients: update PTY size + terminal grid */
+static void mac_server_on_resize(int cols, int rows) {
+    apply_resize(cols, rows);
 }
 
 /* forward declarations */
@@ -2037,9 +2629,20 @@ static void apply_resize(int new_cols, int new_rows) {
     if (new_cols < 10) new_cols = 10; if (new_rows < 4) new_rows = 4;
     if (new_cols > TERM_COLS) new_cols = TERM_COLS;
     if (new_rows > TERM_ROWS) new_rows = TERM_ROWS;
-    int old_cols = term_cols, old_rows = term_rows;
     term_cols = new_cols; term_rows = new_rows;
-    /* clear the grid — the child will redraw everything after SIGWINCH */
+
+    if (g_net_mode == 2) {
+        /* remote client: just update dimensions and tell server — don't clear grid/history.
+           The server's child will redraw and send new content over the wire. */
+        scroll_y = 0; scroll_vel = 0; scroll_snapping = 0; scroll_locked = 1;
+        if (g_net_sock != SOCK_INVALID) {
+            char msg[32]; int len = sprintf(msg, "\x1b_RESIZE;%d;%d\x1b\\", term_cols, term_rows);
+            net_write(g_net_sock, msg, len);
+        }
+        return;
+    }
+
+    /* local or server mode: clear grid — child will redraw after SIGWINCH */
     int r, c;
     for (r = 0; r < TERM_ROWS; r++)
         for (c = 0; c < TERM_COLS; c++) {
@@ -2047,19 +2650,22 @@ static void apply_resize(int new_cols, int new_rows) {
             grid[r][c].fg[0]=grid[r][c].fg[1]=grid[r][c].fg[2]=192; grid[r][c].inv=grid[r][c].bold=0;
         }
     cur_x = 0; cur_y = 0;
-    /* force scroll to bottom and clear history — resize invalidates old layouts */
     scroll_y = 0; scroll_vel = 0; scroll_snapping = 0; scroll_locked = 1;
     hist_count = 0; hist_write = 0;
 #ifndef _WIN32
     if (pty_master >= 0) { struct winsize ws = {(unsigned short)term_rows,(unsigned short)term_cols,0,0}; ioctl(pty_master, TIOCSWINSZ, &ws); }
 #endif
-    if (g_net_mode == 2 && g_net_sock != SOCK_INVALID) {
-        char msg[32]; int len = sprintf(msg, "\x1b_RESIZE;%d;%d\x1b\\", term_cols, term_rows);
-        net_write(g_net_sock, msg, len);
-    }
 }
 
 /* Server mode: headless, forward child↔network (no GL window) */
+/* helpers for headless server resize filtering (use static pty fd) */
+static int _headless_pty_fd;
+static void _headless_fwd_to_child(const char *d, int l) { write(_headless_pty_fd, d, l); }
+static void _headless_on_resize(int c, int r) {
+    struct winsize ws = {(unsigned short)r, (unsigned short)c, 0, 0};
+    ioctl(_headless_pty_fd, TIOCSWINSZ, &ws);
+}
+
 static int run_server(const char *addr, const char *child_cmd, char *const *child_argv) {
     if (net_serve(addr, child_cmd) != 0) return 1;
 
@@ -2096,7 +2702,10 @@ static int run_server(const char *addr, const char *child_cmd, char *const *chil
         }
         if (FD_ISSET(g_net_sock, &rfds)) {
             int n = recv(g_net_sock, buf, sizeof(buf), 0);
-            if (n > 0) write(pty_fd, buf, n);
+            if (n > 0) {
+                _headless_pty_fd = pty_fd;
+                net_filter_and_forward(buf, n, _headless_fwd_to_child, _headless_on_resize);
+            }
             else if (n == 0) break;
         }
         /* check child */
@@ -2234,6 +2843,8 @@ static void menu_cb(int item) {
 - (void)setHoverVol:(id)sender { hover_vol = (int)[sender tag]; }
 - (void)setTypePreset:(id)sender { type_preset = (int)[sender tag]; }
 - (void)setTypeVol:(id)sender { type_vol = (int)[sender tag]; }
+- (void)setDeletePreset:(id)sender { delete_preset = (int)[sender tag]; }
+- (void)setDeleteVol:(id)sender { delete_vol = (int)[sender tag]; }
 - (void)setOutputPreset:(id)sender { output_preset = (int)[sender tag]; }
 - (void)setOutputVol:(id)sender { output_vol = (int)[sender tag]; }
 - (BOOL)validateMenuItem:(NSMenuItem *)item {
@@ -2247,6 +2858,8 @@ static void menu_cb(int item) {
     else if (act == @selector(setHoverVol:)) [item setState:(tag==hover_vol)?NSControlStateValueOn:NSControlStateValueOff];
     else if (act == @selector(setTypePreset:)) [item setState:(tag==type_preset)?NSControlStateValueOn:NSControlStateValueOff];
     else if (act == @selector(setTypeVol:)) [item setState:(tag==type_vol)?NSControlStateValueOn:NSControlStateValueOff];
+    else if (act == @selector(setDeletePreset:)) [item setState:(tag==delete_preset)?NSControlStateValueOn:NSControlStateValueOff];
+    else if (act == @selector(setDeleteVol:)) [item setState:(tag==delete_vol)?NSControlStateValueOn:NSControlStateValueOff];
     else if (act == @selector(setOutputPreset:)) [item setState:(tag==output_preset)?NSControlStateValueOn:NSControlStateValueOff];
     else if (act == @selector(setOutputVol:)) [item setState:(tag==output_vol)?NSControlStateValueOn:NSControlStateValueOff];
     else if (act == @selector(setFontScale:)) [item setState:(tag==font_scale)?NSControlStateValueOn:NSControlStateValueOff];
@@ -2254,6 +2867,27 @@ static void menu_cb(int item) {
 }
 @end
 static DTMenuHandler *g_menu_handler;
+
+/* Subclass NSOpenGLView to redraw during live window resize (prevents scaling) */
+@interface DTGLView : NSOpenGLView
+@end
+@implementation DTGLView
+- (void)reshape {
+    [super reshape];
+    [[self openGLContext] makeCurrentContext];
+    NSSize pts = [self bounds].size;
+    NSSize px = [self convertSizeToBacking:pts];
+    glViewport(0, 0, (int)px.width, (int)px.height);
+    glMatrixMode(GL_PROJECTION); glLoadIdentity();
+    glOrtho(0, pts.width, pts.height, 0, -1, 1);
+    glMatrixMode(GL_MODELVIEW);
+    int new_cols = (int)pts.width / CELL_W, new_rows = (int)pts.height / CELL_H;
+    if (new_cols != term_cols || new_rows != term_rows)
+        apply_resize(new_cols, new_rows);
+    gl_render();
+    [[self openGLContext] flushBuffer];
+}
+@end
 #endif
 
 int main(int argc, char **argv) {
@@ -2402,6 +3036,21 @@ int main(int argc, char **argv) {
         [mi setTag:vi]; [mi setTarget:g_menu_handler];
     }
     [sndMenu addItem:[NSMenuItem separatorItem]];
+    /* Delete sound */
+    [sndMenu addItemWithTitle:@"── Delete Sound ──" action:nil keyEquivalent:@""];
+    for (int si = 0; si < NUM_PRESETS; si++) {
+        NSMenuItem *mi = [sndMenu addItemWithTitle:[NSString stringWithFormat:@"  %s", PRESETS[si].name]
+            action:@selector(setDeletePreset:) keyEquivalent:@""];
+        [mi setTag:si]; [mi setTarget:g_menu_handler];
+    }
+    [sndMenu addItem:[NSMenuItem separatorItem]];
+    [sndMenu addItemWithTitle:@"── Delete Volume ──" action:nil keyEquivalent:@""];
+    for (int vi = 0; vi < 4; vi++) {
+        NSString *vn[] = {@"  Off", @"  Lo", @"  Med", @"  Hi"};
+        NSMenuItem *mi = [sndMenu addItemWithTitle:vn[vi] action:@selector(setDeleteVol:) keyEquivalent:@""];
+        [mi setTag:vi]; [mi setTarget:g_menu_handler];
+    }
+    [sndMenu addItem:[NSMenuItem separatorItem]];
     /* Output sound */
     [sndMenu addItemWithTitle:@"── Output Sound ──" action:nil keyEquivalent:@""];
     for (int si = 0; si < NUM_PRESETS; si++) {
@@ -2438,7 +3087,7 @@ int main(int argc, char **argv) {
         NSOpenGLPFADoubleBuffer, NSOpenGLPFAColorSize, 24, NSOpenGLPFAAlphaSize, 8, 0
     };
     NSOpenGLPixelFormat *pf = [[NSOpenGLPixelFormat alloc] initWithAttributes:attrs];
-    NSOpenGLView *glView = [[NSOpenGLView alloc] initWithFrame:frame pixelFormat:pf];
+    DTGLView *glView = [[DTGLView alloc] initWithFrame:frame pixelFormat:pf];
     [glView setWantsBestResolutionOpenGLSurface:YES];
     [window setContentView:glView];
     [[glView openGLContext] makeCurrentContext];
@@ -2506,7 +3155,7 @@ int main(int argc, char **argv) {
             if (cmd) {
                 if ([chars isEqualToString:@"c"]) { if (sel_mode) { sel_copy(); sel_clear(); } return nil; }
                 if ([chars isEqualToString:@"x"]) {
-                    if (sel_mode) { sel_copy(); sel_delete_via_keys(g_net_mode==2 ? net_write_child : platform_write_child); sel_clear(); }
+                    if (sel_mode) { sel_copy(); sel_play_reverse_morse(); sel_delete_via_keys(g_net_mode==2 ? net_write_child : platform_write_child); sel_clear(); }
                     return nil;
                 }
                 if ([chars isEqualToString:@"1"]) { font_scale = 1; return nil; }
@@ -2557,11 +3206,17 @@ int main(int argc, char **argv) {
             if (raw.length == 1 && [raw characterAtIndex:0] == 27) { sel_clear(); sendToChild("\x1b", 1); return nil; }
             /* backspace */
             if (raw.length == 1 && [raw characterAtIndex:0] == 127) {
-                if (sel_mode) { sel_delete_via_keys(g_net_mode==2 ? net_write_child : platform_write_child); sel_clear(); return nil; }
+                if (sel_mode) { sel_play_reverse_morse(); sel_delete_via_keys(g_net_mode==2 ? net_write_child : platform_write_child); sel_clear(); return nil; }
+                gen_delete_click();
                 sendToChild("\x7f", 1); return nil;
             }
-            /* enter */
-            if (raw.length == 1 && [raw characterAtIndex:0] == 13) { sendToChild("\r", 1); return nil; }
+            /* enter — Option+Enter or Shift+Enter sends ESC+CR (newline in Claude Code input) */
+            if (raw.length == 1 && [raw characterAtIndex:0] == 13) {
+                BOOL opt = (mods & NSEventModifierFlagOption) != 0;
+                if (opt || shift) sendToChild("\x1b\r", 2); /* ESC CR = Alt+Enter */
+                else sendToChild("\r", 1);
+                return nil;
+            }
             /* tab */
             if (raw.length == 1 && [raw characterAtIndex:0] == 9) { sendToChild("\t", 1); return nil; }
             /* ctrl+key */
@@ -2573,6 +3228,7 @@ int main(int argc, char **argv) {
             /* printable */
             if (raw.length > 0) {
                 if (sel_mode && [raw characterAtIndex:0] >= 32) {
+                    sel_play_reverse_morse();
                     sel_delete_via_keys(g_net_mode==2 ? net_write_child : platform_write_child); sel_clear();
                 }
                 const char *utf8 = [raw UTF8String];
@@ -2672,7 +3328,7 @@ int main(int argc, char **argv) {
             }
             if (g_net_mode == 1 && g_server_visible) {
                 net_accept_clients();
-                net_read_all_clients(platform_write_child);
+                net_read_all_clients(platform_write_child, mac_server_on_resize);
             }
         }
 
@@ -2690,7 +3346,7 @@ int main(int argc, char **argv) {
             apply_resize(new_cols, new_rows);
 
         /* trigger output sound if chars were drawn this frame */
-        if (output_chars_this_frame > 0) { gen_output_click(); output_chars_this_frame = 0; }
+        if (output_buf_count > 0) { gen_output_tones(); output_buf_count = 0; }
 
         [[glView openGLContext] makeCurrentContext];
         gl_render();

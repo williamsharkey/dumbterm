@@ -1,10 +1,14 @@
 # Binaries
 dumbterm
 dumbterm.exe
-dumbterm2.exe
+dumbterm[0-9].exe
 dumbterm-server
 *.o
 *.dll
+
+# Generated font data (regenerate with tools/parse-unifont.js)
+tools/unifont_data.js
+tools/unifont_wide.js
 
 # Build artifacts
 *.bak
