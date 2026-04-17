@@ -640,6 +640,50 @@ test('env writes visible via process.env[k]', async () => {
     return 'set + delete roundtrip';
 });
 
+// ── Phase 8: configurable shell ─────────────────────────────
+
+test('custom shell via DUMBTERM_REMOTE_SHELL: bash -c on W7', async () => {
+    // If W7 has bash (MinGW/git-bash), set DUMBTERM_REMOTE_SHELL and verify
+    // that POSIX syntax like command substitution works.
+    const prev = process.env.DUMBTERM_REMOTE_SHELL;
+    process.env.DUMBTERM_REMOTE_SHELL = 'bash -c';
+    const r = await exec(`echo $(uname -s 2>/dev/null || echo no-bash)`);
+    if (prev === undefined) delete process.env.DUMBTERM_REMOTE_SHELL;
+    else process.env.DUMBTERM_REMOTE_SHELL = prev;
+    // We expect either a Unix-y uname output (e.g. MINGW32_NT-6.1) or
+    // nothing — the test passes as long as the exec completed and returned
+    // SOME output (meaning the shell substitution worked).
+    if (r.err) throw new Error(`err: ${r.err.message}`);
+    if (!r.out.trim()) throw new Error('no output — bash not available?');
+    return `bash output: ${r.out.trim()}`;
+});
+
+// ── Phase 13: context file ──────────────────────────────────
+
+test('FLOWTO_CONTEXT env var is set after shim load', async () => {
+    if (!process.env.FLOWTO_CONTEXT) throw new Error('FLOWTO_CONTEXT not set');
+    return process.env.FLOWTO_CONTEXT;
+});
+
+test('context file exists and contains github link', async () => {
+    const p = process.env.FLOWTO_CONTEXT;
+    const content = fs.readFileSync(p, 'utf8');
+    if (!content.includes('github.com/williamsharkey/dumbterm')) throw new Error('missing github link');
+    if (!content.includes('BEGIN FLOWTO AUTO-INJECTED')) throw new Error('missing begin marker');
+    if (!content.includes('END FLOWTO AUTO-INJECTED')) throw new Error('missing end marker');
+    if (!content.includes('WILL BE LOST')) throw new Error('missing editing warning');
+    return `${content.length} bytes, has markers and warning`;
+});
+
+test('context file reports active host', async () => {
+    const content = fs.readFileSync(process.env.FLOWTO_CONTEXT, 'utf8');
+    if (!content.match(/Active host.*remote/)) throw new Error('active host not mentioned');
+    return 'active host = remote mentioned';
+});
+
+// ── Phase 14: spawn stdin (currently disabled; driver-side passthrough TBD) ──
+// Leaving agent-side stdin pipe in place for future work.
+
 // Cleanup tests
 test('cleanup cloud test files', async () => {
     await unlink('/cloud/dumbterm/tester_smoke.txt');

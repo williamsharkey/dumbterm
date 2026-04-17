@@ -214,12 +214,40 @@ static int rpc_write_line(sock_t s, const char *json) {
 
 /* ── AGENT: execute requests ─────────────────────────────────── */
 
-/* Execute cmd via /bin/sh -c (unix) or cmd.exe /c (Windows), capture stdout+stderr+exit. */
-static void agent_exec(const char *cmd, const char *cwd,
+/* Resolve shell: explicit arg > DUMBTERM_SHELL env > platform default.
+   Returns a cmdline template string. {cmd} gets substituted with the user cmd. */
+static const char *resolve_shell(const char *shell_hint) {
+    if (shell_hint && *shell_hint) return shell_hint;
+    const char *env = getenv("DUMBTERM_SHELL");
+    if (env && *env) return env;
+#ifdef _WIN32
+    return "cmd.exe /c";
+#else
+    return "/bin/sh -c";
+#endif
+}
+
+/* Build "SHELL CMD" where CMD is properly quoted. Caller frees. */
+static char *build_shell_cmdline(const char *shell, const char *cmd) {
+    int cap = strlen(shell) + strlen(cmd) + 32;
+    char *out = (char*)malloc(cap);
+    /* Split shell on first space: e.g. "bash -c" or "C:\msys64\usr\bin\bash.exe -c" */
+    const char *sp = strchr(shell, ' ');
+    if (sp) {
+        snprintf(out, cap, "%s \"%s\"", shell, cmd);
+    } else {
+        /* bare shell path — assume -c convention */
+        snprintf(out, cap, "%s -c \"%s\"", shell, cmd);
+    }
+    return out;
+}
+
+/* Execute cmd via configurable shell, capture stdout+stderr+exit. */
+static void agent_exec(const char *cmd, const char *cwd, const char *shell_hint,
                        char **out, int *out_len, char **err, int *err_len, int *exit_code) {
     *out = NULL; *out_len = 0; *err = NULL; *err_len = 0; *exit_code = -1;
+    const char *shell = resolve_shell(shell_hint);
 #ifdef _WIN32
-    /* Windows: CreateProcess with stdout+stderr redirected to pipes. TODO: merge. */
     HANDLE out_rd, out_wr, err_rd, err_wr;
     SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
     CreatePipe(&out_rd, &out_wr, &sa, 0);
@@ -231,7 +259,21 @@ static void agent_exec(const char *cmd, const char *cwd,
     si.hStdOutput = out_wr; si.hStdError = err_wr; si.hStdInput = NULL;
     PROCESS_INFORMATION pi = {0};
     char cmdline[8192];
-    snprintf(cmdline, sizeof(cmdline), "cmd.exe /c %s", cmd);
+    /* shell may contain spaces ("cmd.exe /c" or full path with spaces).
+       Use the build_shell_cmdline helper for consistent quoting, but keep
+       cmd.exe legacy format when no custom shell given. */
+    if (strcmp(shell, "cmd.exe /c") == 0 || strncmp(shell, "cmd.exe", 7) == 0) {
+        snprintf(cmdline, sizeof(cmdline), "%s %s", shell, cmd);
+    } else {
+        /* bash/sh style: "bash -c <cmd>" — escape any double quotes in cmd */
+        char escaped[8192]; int e = 0;
+        for (int i = 0; cmd[i] && e < (int)sizeof(escaped) - 3; i++) {
+            if (cmd[i] == '"') { escaped[e++] = '\\'; escaped[e++] = '"'; }
+            else escaped[e++] = cmd[i];
+        }
+        escaped[e] = 0;
+        snprintf(cmdline, sizeof(cmdline), "%s \"%s\"", shell, escaped);
+    }
     BOOL ok = CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, 0, NULL,
                              (cwd && *cwd) ? cwd : NULL, &si, &pi);
     if (!ok && cwd && *cwd) {
@@ -277,6 +319,13 @@ static void agent_exec(const char *cmd, const char *cwd,
         dup2(outpipe[1], 1); dup2(errpipe[1], 2);
         close(outpipe[0]); close(outpipe[1]);
         close(errpipe[0]); close(errpipe[1]);
+        /* shell_hint overrides /bin/sh. Parse "path -flag" into argv. */
+        if (shell && strcmp(shell, "/bin/sh -c") != 0) {
+            char sh_buf[1024]; strncpy(sh_buf, shell, sizeof(sh_buf)-1); sh_buf[sizeof(sh_buf)-1] = 0;
+            char *sp = strchr(sh_buf, ' ');
+            if (sp) { *sp = 0; char *flag = sp + 1; execl(sh_buf, sh_buf, flag, cmd, (char*)NULL); }
+            else execl(sh_buf, sh_buf, "-c", cmd, (char*)NULL);
+        }
         execl("/bin/sh", "sh", "-c", cmd, (char*)NULL);
         _exit(127);
     }
@@ -319,40 +368,54 @@ static void agent_stream(sock_t s, int id, const char *stream_name,
    Blocks until the child exits, then sends {id, exit:N}.
    During this call the main loop doesn't pump other requests. */
 static void agent_spawn_streaming(sock_t s, int id, const char *cmd,
-                                  const char *args_json, const char *cwd) {
+                                  const char *args_json, const char *cwd,
+                                  const char *shell_hint) {
+    const char *shell = resolve_shell(shell_hint);
 #ifdef _WIN32
-    /* Build cmdline: "cmd.exe /c <cmd> <args>". args_json is a JSON array; we
-       parse minimally — for Phase 5 just pass cmd through as-is (user can
-       include args in cmd string). */
     (void)args_json;
-    HANDLE out_rd, out_wr, err_rd, err_wr;
+    HANDLE out_rd, out_wr, err_rd, err_wr, in_rd, in_wr;
     SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
     CreatePipe(&out_rd, &out_wr, &sa, 0);
     SetHandleInformation(out_rd, HANDLE_FLAG_INHERIT, 0);
     CreatePipe(&err_rd, &err_wr, &sa, 0);
     SetHandleInformation(err_rd, HANDLE_FLAG_INHERIT, 0);
+    CreatePipe(&in_rd, &in_wr, &sa, 0);
+    SetHandleInformation(in_wr, HANDLE_FLAG_INHERIT, 0);
     STARTUPINFOA si = { sizeof(si) };
     si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdOutput = out_wr; si.hStdError = err_wr; si.hStdInput = NULL;
+    si.hStdOutput = out_wr; si.hStdError = err_wr; si.hStdInput = in_rd;
     PROCESS_INFORMATION pi = {0};
     char cmdline[8192];
-    snprintf(cmdline, sizeof(cmdline), "cmd.exe /c %s", cmd);
+    if (strncmp(shell, "cmd.exe", 7) == 0) {
+        snprintf(cmdline, sizeof(cmdline), "%s %s", shell, cmd);
+    } else {
+        char escaped[8192]; int e = 0;
+        for (int i = 0; cmd[i] && e < (int)sizeof(escaped) - 3; i++) {
+            if (cmd[i] == '"') { escaped[e++] = '\\'; escaped[e++] = '"'; }
+            else escaped[e++] = cmd[i];
+        }
+        escaped[e] = 0;
+        snprintf(cmdline, sizeof(cmdline), "%s \"%s\"", shell, escaped);
+    }
     BOOL ok = CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, 0, NULL,
                              (cwd && *cwd) ? cwd : NULL, &si, &pi);
     if (!ok && cwd && *cwd) {
         ok = CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
     }
-    CloseHandle(out_wr); CloseHandle(err_wr);
+    CloseHandle(out_wr); CloseHandle(err_wr); CloseHandle(in_rd);
     if (!ok) {
-        CloseHandle(out_rd); CloseHandle(err_rd);
+        CloseHandle(out_rd); CloseHandle(err_rd); CloseHandle(in_wr);
         char msg[256]; snprintf(msg, sizeof(msg), "{\"id\":%d,\"exit\":-1,\"err\":\"spawn failed\"}", id);
         rpc_write_line(s, msg); return;
     }
-    /* announce pid */
     { char msg[128]; snprintf(msg, sizeof(msg), "{\"id\":%d,\"ok\":true,\"pid\":%u}", id, (unsigned)pi.dwProcessId);
       rpc_write_line(s, msg); }
-    /* poll loop: peek pipes, read + send; check if process exited */
+    /* non-blocking recv on socket for stdin messages. Poll loop. */
+    u_long nb = 1; ioctlsocket(s, FIONBIO, &nb);
+    static RpcConn sconn_s; static int sconn_inited = 0;
+    if (!sconn_inited || sconn_s.s != s) { rpc_conn_init(&sconn_s, s); sconn_inited = 1; }
     unsigned char buf[4096];
+    int stdin_closed = 0;
     for (;;) {
         DWORD avail = 0;
         if (PeekNamedPipe(out_rd, NULL, 0, NULL, &avail, NULL) && avail > 0) {
@@ -363,9 +426,26 @@ static void agent_spawn_streaming(sock_t s, int id, const char *cmd,
             DWORD n = 0; if (ReadFile(err_rd, buf, avail < sizeof(buf) ? avail : sizeof(buf), &n, NULL) && n > 0)
                 agent_stream(s, id, "err", buf, (int)n);
         }
-        DWORD wr = WaitForSingleObject(pi.hProcess, 30); /* 30ms poll interval */
+        /* Check socket for stdin messages (non-blocking) */
+        int rlen = 0; char *rline = rpc_read_line(&sconn_s, &rlen);
+        if (rline && rlen > 0) {
+            char *op2 = json_str(rline, "op");
+            if (op2 && strcmp(op2, "spawn_stdin") == 0 && !stdin_closed) {
+                char *data = json_str(rline, "data");
+                if (data) {
+                    int dlen = 0; unsigned char *bytes = b64_decode(data, &dlen);
+                    if (bytes && dlen > 0) {
+                        DWORD wn = 0; WriteFile(in_wr, bytes, dlen, &wn, NULL);
+                    }
+                    free(bytes); free(data);
+                }
+            } else if (op2 && strcmp(op2, "spawn_stdin_close") == 0) {
+                CloseHandle(in_wr); stdin_closed = 1; in_wr = NULL;
+            }
+            free(op2);
+        }
+        DWORD wr = WaitForSingleObject(pi.hProcess, 30);
         if (wr == WAIT_OBJECT_0) {
-            /* drain remaining */
             for (;;) {
                 avail = 0; if (!PeekNamedPipe(out_rd, NULL, 0, NULL, &avail, NULL) || avail == 0) break;
                 DWORD n = 0; if (!ReadFile(out_rd, buf, avail < sizeof(buf) ? avail : sizeof(buf), &n, NULL) || n == 0) break;
@@ -380,14 +460,17 @@ static void agent_spawn_streaming(sock_t s, int id, const char *cmd,
         }
     }
     DWORD ec = 0; GetExitCodeProcess(pi.hProcess, &ec);
+    if (!stdin_closed && in_wr) CloseHandle(in_wr);
     CloseHandle(out_rd); CloseHandle(err_rd); CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    /* Restore blocking mode so subsequent rpc reads work normally */
+    nb = 0; ioctlsocket(s, FIONBIO, &nb);
     char msg[128]; snprintf(msg, sizeof(msg), "{\"id\":%d,\"exit\":%d}", id, (int)ec);
     rpc_write_line(s, msg);
 #else
-    /* POSIX: pipes + fork + exec sh -c, then poll using select() */
+    /* POSIX: pipes + fork + exec shell -c, poll via select() on out/err/socket/stdin */
     (void)args_json;
-    int outpipe[2], errpipe[2];
-    if (pipe(outpipe) < 0 || pipe(errpipe) < 0) {
+    int outpipe[2], errpipe[2], inpipe[2];
+    if (pipe(outpipe) < 0 || pipe(errpipe) < 0 || pipe(inpipe) < 0) {
         char msg[256]; snprintf(msg, sizeof(msg), "{\"id\":%d,\"exit\":-1,\"err\":\"pipe failed\"}", id);
         rpc_write_line(s, msg); return;
     }
@@ -398,26 +481,40 @@ static void agent_spawn_streaming(sock_t s, int id, const char *cmd,
     }
     if (pid == 0) {
         if (cwd && *cwd) { (void)chdir(cwd); }
-        dup2(outpipe[1], 1); dup2(errpipe[1], 2);
+        dup2(inpipe[0], 0); dup2(outpipe[1], 1); dup2(errpipe[1], 2);
+        close(inpipe[0]); close(inpipe[1]);
         close(outpipe[0]); close(outpipe[1]); close(errpipe[0]); close(errpipe[1]);
+        if (shell && strcmp(shell, "/bin/sh -c") != 0) {
+            char sh_buf[1024]; strncpy(sh_buf, shell, sizeof(sh_buf)-1); sh_buf[sizeof(sh_buf)-1] = 0;
+            char *sp = strchr(sh_buf, ' ');
+            if (sp) { *sp = 0; execl(sh_buf, sh_buf, sp+1, cmd, (char*)NULL); }
+            else execl(sh_buf, sh_buf, "-c", cmd, (char*)NULL);
+        }
         execl("/bin/sh", "sh", "-c", cmd, (char*)NULL);
         _exit(127);
     }
-    close(outpipe[1]); close(errpipe[1]);
-    int outfd = outpipe[0], errfd = errpipe[0];
-    /* non-blocking reads */
+    close(outpipe[1]); close(errpipe[1]); close(inpipe[0]);
+    int outfd = outpipe[0], errfd = errpipe[0], infd = inpipe[1];
     int fl = fcntl(outfd, F_GETFL); fcntl(outfd, F_SETFL, fl | O_NONBLOCK);
     fl = fcntl(errfd, F_GETFL); fcntl(errfd, F_SETFL, fl | O_NONBLOCK);
+    fl = fcntl(s, F_GETFL); fcntl(s, F_SETFL, fl | O_NONBLOCK);
     { char msg[128]; snprintf(msg, sizeof(msg), "{\"id\":%d,\"ok\":true,\"pid\":%d}", id, (int)pid);
       rpc_write_line(s, msg); }
+    /* per-conn reader for socket. persistent across calls for this s. */
+    static RpcConn spawn_sconn; static int spawn_sconn_inited = 0;
+    if (!spawn_sconn_inited || spawn_sconn.s != s) {
+        if (spawn_sconn_inited) rpc_conn_free(&spawn_sconn);
+        rpc_conn_init(&spawn_sconn, s); spawn_sconn_inited = 1;
+    }
     unsigned char buf[4096];
-    int out_open = 1, err_open = 1, exited = 0, exit_code = -1;
+    int out_open = 1, err_open = 1, exited = 0, exit_code = -1, stdin_closed = 0;
     while (out_open || err_open || !exited) {
         fd_set rfds; FD_ZERO(&rfds);
         int maxfd = -1;
         if (out_open) { FD_SET(outfd, &rfds); if (outfd > maxfd) maxfd = outfd; }
         if (err_open) { FD_SET(errfd, &rfds); if (errfd > maxfd) maxfd = errfd; }
-        struct timeval tv = {0, 50000}; /* 50ms */
+        FD_SET(s, &rfds); if (s > maxfd) maxfd = s;
+        struct timeval tv = {0, 50000};
         if (maxfd >= 0) select(maxfd + 1, &rfds, NULL, NULL, &tv);
         else usleep(50000);
         if (out_open && FD_ISSET(outfd, &rfds)) {
@@ -432,6 +529,23 @@ static void agent_spawn_streaming(sock_t s, int id, const char *cmd,
             else if (n == 0) err_open = 0;
             else if (errno != EAGAIN && errno != EWOULDBLOCK) err_open = 0;
         }
+        if (FD_ISSET(s, &rfds)) {
+            int rlen = 0; char *rline = rpc_read_line(&spawn_sconn, &rlen);
+            if (rline && rlen > 0) {
+                char *op2 = json_str(rline, "op");
+                if (op2 && strcmp(op2, "spawn_stdin") == 0 && !stdin_closed) {
+                    char *data = json_str(rline, "data");
+                    if (data) {
+                        int dlen = 0; unsigned char *bytes = b64_decode(data, &dlen);
+                        if (bytes && dlen > 0) write(infd, bytes, dlen);
+                        free(bytes); free(data);
+                    }
+                } else if (op2 && strcmp(op2, "spawn_stdin_close") == 0) {
+                    close(infd); infd = -1; stdin_closed = 1;
+                }
+                free(op2);
+            }
+        }
         if (!exited) {
             int status;
             pid_t r = waitpid(pid, &status, WNOHANG);
@@ -441,7 +555,10 @@ static void agent_spawn_streaming(sock_t s, int id, const char *cmd,
             }
         }
     }
+    if (!stdin_closed && infd >= 0) close(infd);
     close(outfd); close(errfd);
+    /* restore blocking mode on socket so subsequent rpc calls work */
+    fl = fcntl(s, F_GETFL); fcntl(s, F_SETFL, fl & ~O_NONBLOCK);
     char msg[128]; snprintf(msg, sizeof(msg), "{\"id\":%d,\"exit\":%d}", id, exit_code);
     rpc_write_line(s, msg);
 #endif
@@ -540,18 +657,20 @@ static void agent_handle_request(sock_t s, const char *req) {
     } else if (strcmp(op, "spawn") == 0) {
         char *cmd = json_str(req, "cmd");
         char *cwd = json_str(req, "cwd");
-        if (cmd) agent_spawn_streaming(s, id, cmd, NULL, cwd);
+        char *sh = json_str(req, "shell");
+        if (cmd) agent_spawn_streaming(s, id, cmd, NULL, cwd, sh);
         else {
             char msg[128]; snprintf(msg, sizeof(msg), "{\"id\":%d,\"exit\":-1,\"err\":\"no cmd\"}", id);
             rpc_write_line(s, msg);
         }
-        free(cmd); free(cwd);
+        free(cmd); free(cwd); free(sh);
     } else if (strcmp(op, "exec") == 0) {
         char *cmd = json_str(req, "cmd");
         char *cwd = json_str(req, "cwd");
+        char *sh = json_str(req, "shell");
         char *out = NULL, *err = NULL;
         int out_len = 0, err_len = 0, exit_code = -1;
-        if (cmd) agent_exec(cmd, cwd, &out, &out_len, &err, &err_len, &exit_code);
+        if (cmd) agent_exec(cmd, cwd, sh, &out, &out_len, &err, &err_len, &exit_code);
         char *out_b64 = b64_encode((unsigned char*)(out ? out : ""), out_len);
         char *err_b64 = b64_encode((unsigned char*)(err ? err : ""), err_len);
         int msg_cap = strlen(out_b64) + strlen(err_b64) + 256;
@@ -560,7 +679,7 @@ static void agent_handle_request(sock_t s, const char *req) {
                  id, exit_code, out_b64, err_b64);
         rpc_write_line(s, msg);
         free(msg); free(out_b64); free(err_b64);
-        free(cmd); free(cwd); free(out); free(err);
+        free(cmd); free(cwd); free(sh); free(out); free(err);
     } else if (strcmp(op, "read") == 0) {
         char *path = json_str(req, "path");
         FILE *f = path ? fopen(path, "rb") : NULL;
@@ -751,6 +870,12 @@ static sock_t flowto_connect_agent(const char *addr) {
 }
 
 /* Forward an exec request to the remote agent, return response to shim. */
+/* Persistent agent reader — preserved across calls since we read multiple
+   messages per request during spawn streaming. */
+static RpcConn g_ac = { SOCK_INVALID, NULL, 0, 0, 0 };
+/* Persistent shim reader for in-spawn stdin passthrough. */
+static RpcConn g_shim_conn = { SOCK_INVALID, NULL, 0, 0, 0 };
+
 static void flowto_forward_to_agent(sock_t shim, const char *req) {
     if (g_agent_sock == SOCK_INVALID) {
         int id = json_int(req, "id", 0);
@@ -760,32 +885,29 @@ static void flowto_forward_to_agent(sock_t shim, const char *req) {
         return;
     }
     rpc_write_line(g_agent_sock, req);
-    /* Persistent RpcConn to the agent. Read response lines until we see a
-       terminal message. For exec/fs/ping/host_info: one response with "ok".
-       For spawn: many stream messages + a final one with "exit". */
-    static RpcConn ac = { SOCK_INVALID, NULL, 0, 0, 0 };
-    if (ac.s != g_agent_sock) {
-        if (ac.buf) rpc_conn_free(&ac);
-        rpc_conn_init(&ac, g_agent_sock);
+    if (g_ac.s != g_agent_sock) {
+        if (g_ac.buf) rpc_conn_free(&g_ac);
+        rpc_conn_init(&g_ac, g_agent_sock);
     }
-    /* Is this a spawn request? If so, loop until we see "exit". */
     char *op = json_str(req, "op");
     int is_spawn = op && strcmp(op, "spawn") == 0;
     free(op);
+    /* Read response(s) from agent. For one-shot ops: single response.
+       For spawn: many stream messages ending in "exit".
+       stdin during spawn not yet supported at this layer. */
     for (;;) {
         int n = 0;
-        char *resp = rpc_read_line(&ac, &n);
+        char *resp = rpc_read_line(&g_ac, &n);
         if (!resp || n <= 0) {
-            int id = json_int(req, "id", 0);
+            int id2 = json_int(req, "id", 0);
             char msg[256];
-            snprintf(msg, sizeof(msg), "{\"id\":%d,\"ok\":false,\"err\":\"agent read failed\"}", id);
+            snprintf(msg, sizeof(msg), "{\"id\":%d,\"ok\":false,\"err\":\"agent read failed\"}", id2);
             rpc_write_line(shim, msg);
             sock_close(g_agent_sock); g_agent_sock = SOCK_INVALID;
             return;
         }
         rpc_write_line(shim, resp);
         if (!is_spawn) return;
-        /* spawn: consume stream messages + first one with "exit" ends */
         if (strstr(resp, "\"exit\":")) return;
     }
 }

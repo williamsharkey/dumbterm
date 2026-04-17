@@ -37,6 +37,51 @@ if (process.env.DUMBTERM_FLOWTO) {
 }
 let activeHost = process.env.DUMBTERM_FLOWTO ? defaultRemote : 'local';
 
+// ── .flowto.json project profile loader ─────────────────────
+// Walk up from cwd looking for .flowto.json. Load:
+//   defaultHost, remoteCwd, remoteShell, pathMap[[local,remote],...],
+//   virtualCwd, virtualFs, virtualEnv, virtualPlatform, virtualPath, virtualHome
+// Env flags still win if both are set. pathMap is additive.
+function loadProjectProfile() {
+    const path = require('path');
+    const fsSync = require('fs');
+    let dir = origProcess.cwd();
+    let cfg = null, configPath = null;
+    for (let i = 0; i < 20; i++) {
+        const candidate = path.join(dir, '.flowto.json');
+        try {
+            const raw = fsSync.readFileSync(candidate, 'utf8');
+            cfg = JSON.parse(raw); configPath = candidate; break;
+        } catch (e) { /* no config here */ }
+        const parent = path.dirname(dir);
+        if (parent === dir) break;
+        dir = parent;
+    }
+    if (!cfg) return { cfg: {}, configPath: null };
+    return { cfg, configPath };
+}
+const { cfg: projectCfg, configPath: projectCfgPath } = loadProjectProfile();
+if (projectCfgPath) {
+    process.stderr.write('flowto: loaded profile from ' + projectCfgPath + '\n');
+}
+
+// Config-applied values (env still wins when explicitly set)
+function cfgBool(envKey, cfgKey) {
+    if (process.env[envKey]) return process.env[envKey] === '1';
+    return !!projectCfg[cfgKey];
+}
+function cfgStr(envKey, cfgKey, fallback) {
+    return process.env[envKey] || projectCfg[cfgKey] || fallback || '';
+}
+
+// Remote cwd/shell from config
+if (projectCfg.remoteCwd && hosts[defaultRemote]) hosts[defaultRemote].cwd = projectCfg.remoteCwd;
+if (projectCfg.remoteShell && hosts[defaultRemote]) hosts[defaultRemote].shell = projectCfg.remoteShell;
+if (projectCfg.defaultHost) activeHost = projectCfg.defaultHost;
+
+// pathMap: [[localPrefix, remotePrefix], ...]
+const pathMap = Array.isArray(projectCfg.pathMap) ? projectCfg.pathMap : [];
+
 // ── RPC connection (synchronous on a dedicated socket) ───────
 // We need synchronous-style RPC because child_process.execSync must block.
 // Node's net API is async; we use a trick: spawn a helper via child_process
@@ -152,27 +197,45 @@ const EventEmitter = require('events');
 
 function makeRemoteChild(cmdString, options) {
     const useHost = activeHost;
-    const cwd = options.cwd || (hosts[useHost] && hosts[useHost].cwd) || '';
+    let cwd = options.cwd || (hosts[useHost] && hosts[useHost].cwd) || '';
+    cwd = translateForHost(cwd, useHost);
+    const shell = (hosts[useHost] && hosts[useHost].shell) || process.env.DUMBTERM_REMOTE_SHELL || '';
     const child = new EventEmitter();
     const stdoutStream = new Readable({ read() {} });
     const stderrStream = new Readable({ read() {} });
-    const stdinStub = new Writable({ write(chunk, enc, cb) { cb(new Error('flowto: spawn.stdin not yet supported')); } });
+    let _spawnId = null; // set once the agent responds with pid
+    const stdinStream = new Writable({
+        write(chunk, enc, cb) {
+            if (_spawnId == null) { cb(new Error('child not yet spawned')); return; }
+            const b64 = Buffer.from(chunk).toString('base64');
+            // Bypass rpcCall id auto-increment; we reuse the spawn's id.
+            // Direct socket write with op:spawn_stdin and the same id as spawn.
+            const req = JSON.stringify({ op: 'spawn_stdin', id: _spawnId, data: b64 }) + '\n';
+            if (_conn) { _conn.write(req, cb); } else cb(new Error('no gateway'));
+        },
+        final(cb) {
+            if (_spawnId == null) return cb();
+            const req = JSON.stringify({ op: 'spawn_stdin_close', id: _spawnId }) + '\n';
+            if (_conn) { _conn.write(req, cb); } else cb();
+        }
+    });
     child.stdout = stdoutStream;
     child.stderr = stderrStream;
-    child.stdin = stdinStub;
+    child.stdin = stdinStream;
     child.pid = null;
     child.killed = false;
     child.exitCode = null;
     child.signalCode = null;
     child.kill = function () { /* not yet supported */ };
 
-    rpcStream({ op: 'spawn', host: useHost, cmd: cmdString, cwd }, (err, msg) => {
+    rpcStream({ op: 'spawn', host: useHost, cmd: cmdString, cwd, shell }, (err, msg) => {
         if (err) {
             stdoutStream.destroy(err);
             stderrStream.destroy(err);
             child.emit('error', err);
             return;
         }
+        if (_spawnId == null && msg && msg.id != null) _spawnId = msg.id;
         if (msg.ok && msg.pid) {
             child.pid = msg.pid;
             child.emit('spawn');
@@ -262,8 +325,10 @@ child_process.exec = function (command, options, callback) {
 
     // Remote: RPC to the gateway. Use virtual cwd of target host (not process.cwd()
     // which would leak a Mac path to a Windows agent).
-    const targetCwd = options.cwd || (hosts[useHost] && hosts[useHost].cwd) || '';
-    rpcCall({ op: 'exec', host: useHost, cmd: useCmd, cwd: targetCwd }, (err, resp) => {
+    let targetCwd = options.cwd || (hosts[useHost] && hosts[useHost].cwd) || '';
+    targetCwd = translateForHost(targetCwd, useHost);
+    const targetShell = (hosts[useHost] && hosts[useHost].shell) || process.env.DUMBTERM_REMOTE_SHELL || '';
+    rpcCall({ op: 'exec', host: useHost, cmd: useCmd, cwd: targetCwd, shell: targetShell }, (err, resp) => {
         if (err) { if (callback) callback(err, '', ''); return; }
         const out = Buffer.from(resp.out || '', 'base64').toString('utf8');
         const errStr = Buffer.from(resp.err || '', 'base64').toString('utf8');
@@ -286,17 +351,14 @@ const PERSISTENT_HOST = process.env.DUMBTERM_PERSISTENT_HOST || defaultRemote;
 const CLOUD_PREFIX = '/cloud/dumbterm/';
 const CLOUD_HOME = '/cloud/dumbterm/home';
 const CLOUD_BACKING = process.env.DUMBTERM_CLOUD_BACKING || 'C:\\workspace\\dumbterm-cloud';
-// Virtualization modes — all opt-in so real apps (Claude Code etc.) get
-// minimal interference. Tester sets them all to 1 to exercise the machinery.
-// exec routing stays always-on — that's the core feature.
-const VIRTUAL_HOME_ENABLED     = process.env.DUMBTERM_VIRTUAL_HOME === '1';
-const VIRTUAL_CWD_ENABLED      = process.env.DUMBTERM_VIRTUAL_CWD === '1';
-const VIRTUAL_PLATFORM_ENABLED = process.env.DUMBTERM_VIRTUAL_PLATFORM === '1';
-const VIRTUAL_PATH_ENABLED     = process.env.DUMBTERM_VIRTUAL_PATH === '1';
-const VIRTUAL_ENV_ENABLED      = process.env.DUMBTERM_VIRTUAL_ENV === '1';
-// fs routing — if off, local fs passes through, /cloud/ still routes.
-// If on, any fs call routes per active host's cwd (Phase 2 behavior).
-const VIRTUAL_FS_ENABLED       = process.env.DUMBTERM_VIRTUAL_FS === '1';
+// Virtualization modes — all opt-in. Read from env first, then .flowto.json.
+const VIRTUAL_HOME_ENABLED     = cfgBool('DUMBTERM_VIRTUAL_HOME',     'virtualHome');
+const VIRTUAL_CWD_ENABLED      = cfgBool('DUMBTERM_VIRTUAL_CWD',      'virtualCwd');
+const VIRTUAL_PLATFORM_ENABLED = cfgBool('DUMBTERM_VIRTUAL_PLATFORM', 'virtualPlatform');
+const VIRTUAL_PATH_ENABLED     = cfgBool('DUMBTERM_VIRTUAL_PATH',     'virtualPath');
+const VIRTUAL_ENV_ENABLED      = cfgBool('DUMBTERM_VIRTUAL_ENV',      'virtualEnv');
+const VIRTUAL_FS_ENABLED       = cfgBool('DUMBTERM_VIRTUAL_FS',       'virtualFs');
+const PATH_TRANSLATE_ENABLED   = cfgBool('DUMBTERM_PATH_TRANSLATE',   'pathTranslate') || pathMap.length > 0;
 
 function isCloudPath(p) {
     return typeof p === 'string' && p.startsWith('/cloud/');
@@ -310,11 +372,31 @@ function translateCloudPath(p) {
 }
 
 // Which host should a path go to?
+// - /cloud/... always persists to PERSISTENT_HOST
+// - Paths matching pathMap's local prefixes route to the remote (active host)
+// - Otherwise: VIRTUAL_FS=1 → active; else local
 function routeForPath(p) {
     if (isCloudPath(p)) return PERSISTENT_HOST;
-    // When fs virtualization is off, all non-cloud paths stay local.
+    if (PATH_TRANSLATE_ENABLED && pathMap.length) {
+        for (const [local,] of pathMap) {
+            if (typeof p === 'string' && p.startsWith(local)) return activeHost;
+        }
+    }
     if (!VIRTUAL_FS_ENABLED) return 'local';
     return activeHost;
+}
+
+// Translate a path from driver (Mac) convention to active host convention.
+// Prefix substitution via pathMap. No-op if no mapping matches.
+function translateForHost(p, hostName) {
+    if (typeof p !== 'string') return p;
+    if (isCloudPath(p)) return translateCloudPath(p);
+    if (!PATH_TRANSLATE_ENABLED || !pathMap.length) return p;
+    if (hostName === 'local') return p;
+    for (const [local, remote] of pathMap) {
+        if (p.startsWith(local)) return remote + p.slice(local.length);
+    }
+    return p;
 }
 
 // ── Override HOME / os.homedir (opt-in) ──────────────────────
@@ -350,7 +432,7 @@ fs.readFile = function (path, opts, cb) {
     if (host === 'local') {
         return origReadFile.call(this, path, opts, cb);
     }
-    const remotePath = isCloudPath(path) ? translateCloudPath(path) : path;
+    const remotePath = translateForHost(path, host);
     rpcCall({ op: 'read', host, path: remotePath }, (err, resp) => {
         if (err) return cb && cb(err);
         if (!resp.ok) {
@@ -372,7 +454,7 @@ fs.writeFile = function (path, data, opts, cb) {
     if (host === 'local') {
         return origWriteFile.call(this, path, data, opts, cb);
     }
-    const remotePath = isCloudPath(path) ? translateCloudPath(path) : path;
+    const remotePath = translateForHost(path, host);
     const buf = Buffer.isBuffer(data) ? data : Buffer.from(String(data), (opts && opts.encoding) || 'utf8');
     rpcCall({ op: 'write', host, path: remotePath, data: buf.toString('base64') }, (err, resp) => {
         if (err) return cb && cb(err);
@@ -391,7 +473,7 @@ fs.readdir = function (path, opts, cb) {
     if (typeof opts === 'function') { cb = opts; opts = undefined; }
     const host = routeForPath(path);
     if (host === 'local') return origReaddir.call(this, path, opts, cb);
-    const remotePath = isCloudPath(path) ? translateCloudPath(path) : path;
+    const remotePath = translateForHost(path, host);
     rpcCall({ op: 'readdir', host, path: remotePath }, (err, resp) => {
         if (err) return cb && cb(err);
         if (!resp.ok) {
@@ -408,7 +490,7 @@ fs.stat = function (path, opts, cb) {
     if (typeof opts === 'function') { cb = opts; opts = undefined; }
     const host = routeForPath(path);
     if (host === 'local') return origStat.call(this, path, opts, cb);
-    const remotePath = isCloudPath(path) ? translateCloudPath(path) : path;
+    const remotePath = translateForHost(path, host);
     rpcCall({ op: 'stat', host, path: remotePath }, (err, resp) => {
         if (err) return cb && cb(err);
         if (!resp.ok) {
@@ -429,7 +511,7 @@ const origUnlink = fs.unlink;
 fs.unlink = function (path, cb) {
     const host = routeForPath(path);
     if (host === 'local') return origUnlink.call(this, path, cb);
-    const remotePath = isCloudPath(path) ? translateCloudPath(path) : path;
+    const remotePath = translateForHost(path, host);
     rpcCall({ op: 'unlink', host, path: remotePath }, (err, resp) => {
         if (err) return cb && cb(err);
         if (!resp.ok) { const e = new Error(resp.errno || 'EIO'); e.code = resp.errno || 'EIO'; return cb && cb(e); }
@@ -443,7 +525,7 @@ fs.mkdir = function (path, opts, cb) {
     if (typeof opts === 'function') { cb = opts; opts = undefined; }
     const host = routeForPath(path);
     if (host === 'local') return origMkdir.call(this, path, opts, cb);
-    const remotePath = isCloudPath(path) ? translateCloudPath(path) : path;
+    const remotePath = translateForHost(path, host);
     rpcCall({ op: 'mkdir', host, path: remotePath }, (err, resp) => {
         if (err) return cb && cb(err);
         if (!resp.ok) { const e = new Error(resp.errno || 'EIO'); e.code = resp.errno || 'EIO'; return cb && cb(e); }
@@ -591,7 +673,126 @@ if (VIRTUAL_ENV_ENABLED) (function patchEnv() {
 if (process.env.DUMBTERM_FLOWTO) {
     refreshHostInfo(defaultRemote, (err) => {
         if (err) process.stderr.write('flowto: host_info failed: ' + err.message + '\n');
+        else writeContextFile();
     });
+} else {
+    writeContextFile();
+}
+
+// ── Phase 13: write FLOWTO_CONTEXT.md so Claude Code can discover the setup ───
+// Strategy:
+//   FLOWTO_CONTEXT_PATH env var specifies a file to update. If unset, we
+//   write a standalone file at /tmp/flowto-context.md.
+//
+//   For files that may be user-edited (e.g. a project's CLAUDE.md), the user
+//   points FLOWTO_CONTEXT_PATH at that file and we update ONLY the region
+//   between two sentinel markers. Content outside the markers is preserved.
+//   Running the shim repeatedly replaces only the managed block.
+const FLOWTO_BEGIN = '<!-- ⚠️  BEGIN FLOWTO AUTO-INJECTED BLOCK  ⚠️ -->';
+const FLOWTO_END   = '<!-- ⚠️  END FLOWTO AUTO-INJECTED BLOCK  ⚠️ -->';
+const FLOWTO_WARNING = [
+    '',
+    '> **⚠️  IF YOU ARE EDITING THIS FILE:**',
+    '>',
+    '> Everything between the `BEGIN FLOWTO AUTO-INJECTED BLOCK` marker and the',
+    '> `END FLOWTO AUTO-INJECTED BLOCK` marker is **regenerated on every flowto',
+    '> session start**. Anything you write inside that block **WILL BE LOST**.',
+    '>',
+    '> To add your own notes: **write them OUTSIDE the markers** (above the BEGIN',
+    '> line or below the END line). The flowto shim only replaces content between',
+    '> the markers and preserves everything else.',
+    '>',
+    '> If this file has been edited by mistake and now has duplicate blocks,',
+    '> delete all FLOWTO blocks — the shim will regenerate a clean one next run.',
+    '',
+].join('\n');
+
+function writeContextFile() {
+    if (cfgBool('DUMBTERM_SKIP_CONTEXT', 'skipContext')) return;
+    const fsSync = require('fs');
+    const lines = [];
+    lines.push(FLOWTO_BEGIN);
+    lines.push(FLOWTO_WARNING);
+    lines.push('# flowto session context');
+    lines.push('');
+    lines.push('This Node process is running under **flowto** — a transparent tool-execution proxy.');
+    lines.push('Your `Bash` tool (via `child_process.exec` / `spawn`) and `fs.*` calls may route');
+    lines.push('to a remote agent instead of the local machine.');
+    lines.push('');
+    lines.push('## Active configuration');
+    lines.push('');
+    lines.push('- **Active host**: `' + activeHost + '`');
+    if (projectCfgPath) lines.push('- **Project profile**: `' + projectCfgPath + '`');
+    if (VIRTUAL_FS_ENABLED) lines.push('- **fs virtualization**: ON (non-local fs routes to `' + activeHost + '`)');
+    if (VIRTUAL_CWD_ENABLED) lines.push('- **cwd virtualization**: ON');
+    if (VIRTUAL_PLATFORM_ENABLED) lines.push('- **process.platform virtualization**: ON');
+    if (VIRTUAL_PATH_ENABLED) lines.push('- **path module virtualization**: ON');
+    if (VIRTUAL_ENV_ENABLED) lines.push('- **process.env virtualization**: ON');
+    if (VIRTUAL_HOME_ENABLED) lines.push('- **HOME redirected to `/cloud/dumbterm/home`**');
+    if (pathMap.length) {
+        lines.push('- **Path mappings**:');
+        for (const [l, r] of pathMap) lines.push('  - `' + l + '` → `' + r + '`');
+    }
+    if (hosts[activeHost] && hosts[activeHost].shell) {
+        lines.push('- **Remote shell**: `' + hosts[activeHost].shell + '`');
+    }
+    lines.push('');
+    lines.push('## Meta commands available via Bash');
+    lines.push('');
+    lines.push('- `dumbterm-host list` — show registered hosts, mark active');
+    lines.push('- `dumbterm-host <name>` — switch active host (e.g. `dumbterm-host local`)');
+    lines.push('- `dumbterm-at <host> <cmd>` — one-shot run on a specific host without switching');
+    lines.push('');
+    lines.push('## Notes for tool use');
+    lines.push('');
+    if (hosts[activeHost] && hosts[activeHost].shell && hosts[activeHost].shell.indexOf('bash') >= 0) {
+        lines.push('- The remote shell is bash (msys/MinGW on Windows). Use POSIX commands (`ls`,');
+        lines.push('  `cat`, `grep`, `find`, `git`, `gcc`). Avoid cmd.exe builtins (`ver`, `dir`).');
+    }
+    if (pathMap.length) {
+        lines.push('- You may use either local or remote paths; mapped prefixes are auto-translated.');
+    }
+    lines.push('');
+    lines.push('## More info');
+    lines.push('');
+    lines.push('- **flowto source**: https://github.com/williamsharkey/dumbterm');
+    lines.push('- **Protocol**: newline-delimited JSON over TCP; base64 for binary payloads');
+    lines.push('- **Shim**: `flowto_shim.js` injected via `--require` before this process starts');
+    lines.push('');
+    lines.push(FLOWTO_END);
+    const managed = lines.join('\n');
+
+    const outPath = process.env.FLOWTO_CONTEXT_PATH || '/tmp/flowto-context.md';
+    try {
+        let existing = '';
+        try { existing = fsSync.readFileSync(outPath, 'utf8'); } catch (e) { /* new file */ }
+
+        // Strip ALL existing auto-injected blocks (handles duplicates from bad edits).
+        // Regex matches any block between our markers, including the markers themselves.
+        // Using indexOf loops (not regex) so users can safely include the markers in
+        // discussions elsewhere without triggering accidental match.
+        let cleaned = existing;
+        for (;;) {
+            const b = cleaned.indexOf(FLOWTO_BEGIN);
+            if (b < 0) break;
+            const e = cleaned.indexOf(FLOWTO_END, b + FLOWTO_BEGIN.length);
+            if (e < 0) break; // malformed: leave as-is
+            const before = cleaned.slice(0, b).replace(/\n+$/, '');
+            const after = cleaned.slice(e + FLOWTO_END.length).replace(/^\n+/, '');
+            cleaned = before + (before && after ? '\n\n' : '') + after;
+        }
+
+        let next;
+        if (cleaned.length > 0) {
+            next = cleaned.replace(/\n+$/, '') + '\n\n' + managed + '\n';
+        } else {
+            next = managed + '\n';
+        }
+        fsSync.writeFileSync(outPath, next);
+        process.env.FLOWTO_CONTEXT = outPath;
+    } catch (e) {
+        // best effort; don't fail the shim
+    }
 }
 
 // Expand the meta-command to refresh host info on first switch
