@@ -52,6 +52,12 @@ static sock_t g_net_sock = SOCK_INVALID;
 static int g_net_mode = 0; /* 0=local, 1=listen(server), 2=connect(client) */
 static int g_server_visible = 0; /* --visible: show local window while serving */
 
+/* --flowto: spawn child here, route tool calls (via JS shim RPC) to remote agent.
+   --agent: act as agent — listen for RPC requests, execute locally. */
+static char *g_flowto_addr = NULL;  /* --flowto HOST:PORT */
+static char *g_agent_addr  = NULL;  /* --agent PORT */
+static int   g_flowto_selftest = 0; /* --selftest: run flowto self-test */
+
 /* multi-client support for server mode */
 #define MAX_CLIENTS 10
 static sock_t g_clients[MAX_CLIENTS];
@@ -82,6 +88,11 @@ static int   cursor_phosphor_row[CURSOR_PHOSPHOR_MAX];
 static int   cursor_phosphor_count;
 /* blink state: wall-clock driven for precise timing */
 static double cursor_blink_next; /* next blink time (CFAbsoluteTime) */
+/* Debounce _RESIZE sends from remote client to avoid flooding W7 during drag */
+double g_pending_resize_at = 0;
+int g_pending_resize_cols = 0, g_pending_resize_rows = 0;
+int g_last_sent_cols = 0, g_last_sent_rows = 0;
+#define RESIZE_DEBOUNCE_SEC 0.15
 #define CURSOR_BLINK_SEC 0.4 /* seconds between blinks */
 
 /* ── morse scan-line visualization ─────────────────────────────── */
@@ -1125,24 +1136,31 @@ static void net_accept_clients(void) {
     sock_t c = accept(g_listen_sock, (struct sockaddr*)&ca, (void*)&calen);
     if (c == SOCK_INVALID) return;
     if (g_num_clients >= MAX_CLIENTS) { sock_close(c); return; }
+    /* Send grid state while socket is still BLOCKING — the dump can exceed
+       the kernel send buffer, and non-blocking send would drop bytes. */
+    fprintf(stderr, "dumbterm: client %d connected (%d total)\n", g_num_clients+1, g_num_clients+1);
+    net_send_grid_state(c);
     net_set_nonblock(c);
     g_clients[g_num_clients++] = c;
-    fprintf(stderr, "dumbterm: client %d connected (%d total)\n", g_num_clients, g_num_clients);
-    /* send current screen state so client isn't blank */
-    net_send_grid_state(c);
 }
 
-/* Broadcast bytes to all connected clients */
+/* Broadcast bytes to all connected clients. Treats transient WSAEWOULDBLOCK /
+   EAGAIN as "try later" — only evicts on real disconnection. */
 static void net_broadcast(const char *data, int len) {
     int i;
     for (i = 0; i < g_num_clients; i++) {
-        if (send(g_clients[i], data, len, 0) <= 0) {
-            /* client disconnected — remove */
-            fprintf(stderr, "dumbterm: client %d disconnected\n", i+1);
-            sock_close(g_clients[i]);
-            g_clients[i] = g_clients[--g_num_clients];
-            i--;
-        }
+        int n = send(g_clients[i], data, len, 0);
+        if (n >= 0) continue; /* partial send OK; kernel buffers the rest */
+#ifdef _WIN32
+        int err = WSAGetLastError();
+        if (err == WSAEWOULDBLOCK) continue; /* buffer full — skip this frame */
+#else
+        if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
+#endif
+        fprintf(stderr, "dumbterm: client %d disconnected\n", i+1);
+        sock_close(g_clients[i]);
+        g_clients[i] = g_clients[--g_num_clients];
+        i--;
     }
 }
 
@@ -1280,6 +1298,8 @@ static void net_write(sock_t s, const char *data, int len) {
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <gl/gl.h>
+
+#include "flowto.c"
 
 static HWND g_hwnd;
 static HDC g_hdc;
@@ -1704,6 +1724,12 @@ int main(int argc, char **argv) {
             g_connect_addr = argv[++i]; g_net_mode = 2;
         } else if (strcmp(argv[i], "--visible") == 0) {
             g_server_visible = 1;
+        } else if (strcmp(argv[i], "--flowto") == 0 && i+1 < argc) {
+            g_flowto_addr = argv[++i];
+        } else if (strcmp(argv[i], "--agent") == 0 && i+1 < argc) {
+            g_agent_addr = argv[++i];
+        } else if (strcmp(argv[i], "--selftest") == 0) {
+            g_flowto_selftest = 1;
         } else if (strcmp(argv[i], "--") == 0) { i++; break; }
         else break;
     }
@@ -1711,6 +1737,11 @@ int main(int argc, char **argv) {
         static char cmdbuf[4096]; cmdbuf[0]=0;
         int ci; for(ci=i;ci<argc;ci++){if(ci>i)strcat(cmdbuf," ");strcat(cmdbuf,argv[ci]);}
         child_cmd = cmdbuf;
+    }
+
+    /* AGENT MODE: headless RPC server for --flowto clients */
+    if (g_agent_addr) {
+        return flowto_run_agent(g_agent_addr);
     }
 
     /* SERVER MODE: headless only (no --visible) */
@@ -1792,6 +1823,11 @@ done:
 #include <errno.h>
 #include <fcntl.h>
 #include <termios.h>
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <mach-o/dyld.h>
+
+#include "flowto.c"
 
 static int pty_master = -1;
 
@@ -2045,12 +2081,230 @@ static void scroll_update(void) {
     scroll_locked = (scroll_y < 1.0f);
 }
 
+/* ── CRT shader (mattiasgustavsson/crtview, MIT/Public Domain) ──────
+   Post-process pass: render terminal to FBO, then draw fullscreen quad
+   with CRT shader (curvature, scanlines, shadow mask, vignette, noise,
+   flicker, chromatic aberration, tone mapping). */
+static int   crt_enabled;              /* 0=off, 1=on */
+static GLuint crt_fbo;
+static GLuint crt_fbo_tex;
+static GLuint crt_stub_tex;            /* 1x1 black, bound to blurbuffer+frametexture */
+static int   crt_fbo_w, crt_fbo_h;     /* current FBO dimensions */
+static GLuint crt_program;
+static GLint crt_u_backbuffer, crt_u_blurbuffer, crt_u_frametexture, crt_u_useframe;
+static GLint crt_u_modulate, crt_u_resolution, crt_u_time;
+static GLint crt_u_cfg[18];            /* all cfg_* uniforms */
+static double crt_time_start;
+
+static const char *CRT_VS =
+    "#version 120\n"
+    "attribute vec4 pos;\n"
+    "varying vec2 uv;\n"
+    "void main() { gl_Position = vec4(pos.xy, 0.0, 1.0); uv = pos.zw; }\n";
+
+static const char *CRT_FS =
+    "#version 120\n"
+    "varying vec2 uv;\n"
+    "uniform vec3 modulate;\n"
+    "uniform vec2 resolution;\n"
+    "uniform float time;\n"
+    "uniform sampler2D backbuffer;\n"
+    "uniform sampler2D blurbuffer;\n"
+    "uniform sampler2D frametexture;\n"
+    "uniform float use_frame;\n"
+    "uniform float cfg_curvature;\n"
+    "uniform float cfg_scanlines;\n"
+    "uniform float cfg_shadow_mask;\n"
+    "uniform float cfg_separation;\n"
+    "uniform float cfg_ghosting;\n"
+    "uniform float cfg_noise;\n"
+    "uniform float cfg_flicker;\n"
+    "uniform float cfg_vignette;\n"
+    "uniform float cfg_distortion;\n"
+    "uniform float cfg_aspect_lock;\n"
+    "uniform float cfg_hpos;\n"
+    "uniform float cfg_vpos;\n"
+    "uniform float cfg_hsize;\n"
+    "uniform float cfg_vsize;\n"
+    "uniform float cfg_contrast;\n"
+    "uniform float cfg_brightness;\n"
+    "uniform float cfg_saturation;\n"
+    "uniform float cfg_degauss;\n"
+    "vec3 tsample(sampler2D samp, vec2 tc, float offs, vec2 resolution) {\n"
+    "  vec3 s = pow(abs(texture2D(samp, vec2(tc.x, 1.0-tc.y)).rgb), vec3(2.2));\n"
+    "  return s * vec3(1.25);\n"
+    "}\n"
+    "vec3 filmic(vec3 c) {\n"
+    "  vec3 x = max(vec3(0.0), c - vec3(0.004));\n"
+    "  return (x*(6.2*x+0.5))/(x*(6.2*x+1.7)+0.06);\n"
+    "}\n"
+    "vec2 curve(vec2 uv) {\n"
+    "  uv = (uv - 0.5) * 2.0;\n"
+    "  uv *= vec2(1.049, 1.042);\n"
+    "  uv -= vec2(-0.008, 0.008);\n"
+    "  uv.x *= 1.0 + pow((abs(uv.y)/5.0), 2.0);\n"
+    "  uv.y *= 1.0 + pow((abs(uv.x)/4.0), 2.0);\n"
+    "  return uv / 2.0 + 0.5;\n"
+    "}\n"
+    "float rand(vec2 co) { return fract(sin(dot(co, vec2(12.9898,78.233))) * 43758.5453); }\n"
+    "void main() {\n"
+    "  vec2 curved_uv = mix(curve(uv), uv, 0.4);\n"
+    "  vec2 scuv = curved_uv;\n"
+    "  vec3 col;\n"
+    "  float x = sin(0.1*time+curved_uv.y*13.0)*sin(0.23*time+curved_uv.y*19.0)*sin(0.3+0.11*time+curved_uv.y*23.0)*0.0012;\n"
+    "  float o = sin(gl_FragCoord.y/1.5)/resolution.x;\n"
+    "  x += o*0.25; x *= 0.2;\n"
+    "  col.r = tsample(backbuffer, vec2(x+scuv.x+0.0009, scuv.y+0.0009), resolution.y/800.0, resolution).x + 0.02;\n"
+    "  col.g = tsample(backbuffer, vec2(x+scuv.x+0.0000, scuv.y-0.0011), resolution.y/800.0, resolution).y + 0.02;\n"
+    "  col.b = tsample(backbuffer, vec2(x+scuv.x-0.0015, scuv.y+0.0000), resolution.y/800.0, resolution).z + 0.02;\n"
+    "  float i = clamp(col.r*0.299 + col.g*0.587 + col.b*0.114, 0.0, 1.0);\n"
+    "  i = pow(1.0 - pow(i, 2.0), 1.0);\n"
+    "  i = (1.0-i)*0.85 + 0.15;\n"
+    "  col *= vec3(0.95, 1.05, 0.95);\n"
+    "  col = clamp(col*1.3 + 0.75*col*col + 1.25*col*col*col*col*col, vec3(0.0), vec3(10.0));\n"
+    "  float vig = (0.1 + 1.0*16.0*curved_uv.x*curved_uv.y*(1.0-curved_uv.x)*(1.0-curved_uv.y));\n"
+    "  vig = 1.3 * pow(vig, 0.5); col *= vig;\n"
+    "  float scans = clamp(0.35 + 0.18*sin(6.0*time + curved_uv.y*resolution.y*1.5), 0.0, 1.0);\n"
+    "  col *= vec3(pow(scans, 0.9));\n"
+    "  col *= 1.0 - 0.23 * clamp(mod(gl_FragCoord.x, 3.0)/2.0, 0.0, 1.0);\n"
+    "  col = filmic(col);\n"
+    "  vec2 seed = curved_uv * resolution.xy;\n"
+    "  col -= 0.015 * pow(vec3(rand(seed+time), rand(seed+time*2.0), rand(seed+time*3.0)), vec3(1.5));\n"
+    "  col *= 1.0 - 0.004 * (sin(50.0*time + curved_uv.y*2.0)*0.5 + 0.5);\n"
+    "  if (curved_uv.x < 0.0 || curved_uv.x > 1.0) col *= 0.0;\n"
+    "  if (curved_uv.y < 0.0 || curved_uv.y > 1.0) col *= 0.0;\n"
+    "  gl_FragColor = vec4(col, 1.0) * vec4(modulate, 1.0);\n"
+    "}\n";
+
+static GLuint crt_compile_shader(GLenum type, const char *src) {
+    GLuint s = glCreateShader(type);
+    glShaderSource(s, 1, &src, NULL);
+    glCompileShader(s);
+    GLint ok = 0; glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        char buf[2048]; GLsizei n = 0;
+        glGetShaderInfoLog(s, sizeof(buf), &n, buf);
+        fprintf(stderr, "CRT shader compile failed:\n%.*s\n", (int)n, buf);
+        glDeleteShader(s); return 0;
+    }
+    return s;
+}
+
+static void crt_init(void) {
+    GLuint vs = crt_compile_shader(GL_VERTEX_SHADER, CRT_VS);
+    GLuint fs = crt_compile_shader(GL_FRAGMENT_SHADER, CRT_FS);
+    if (!vs || !fs) return;
+    crt_program = glCreateProgram();
+    glAttachShader(crt_program, vs);
+    glAttachShader(crt_program, fs);
+    glBindAttribLocation(crt_program, 0, "pos");
+    glLinkProgram(crt_program);
+    GLint ok = 0; glGetProgramiv(crt_program, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        char buf[2048]; GLsizei n = 0;
+        glGetProgramInfoLog(crt_program, sizeof(buf), &n, buf);
+        fprintf(stderr, "CRT link failed: %.*s\n", (int)n, buf);
+        glDeleteProgram(crt_program); crt_program = 0; return;
+    }
+    glDeleteShader(vs); glDeleteShader(fs);
+
+    crt_u_backbuffer   = glGetUniformLocation(crt_program, "backbuffer");
+    crt_u_blurbuffer   = glGetUniformLocation(crt_program, "blurbuffer");
+    crt_u_frametexture = glGetUniformLocation(crt_program, "frametexture");
+    crt_u_useframe     = glGetUniformLocation(crt_program, "use_frame");
+    crt_u_modulate     = glGetUniformLocation(crt_program, "modulate");
+    crt_u_resolution   = glGetUniformLocation(crt_program, "resolution");
+    crt_u_time         = glGetUniformLocation(crt_program, "time");
+    const char *cfgs[] = {"cfg_curvature","cfg_scanlines","cfg_shadow_mask","cfg_separation",
+        "cfg_ghosting","cfg_noise","cfg_flicker","cfg_vignette","cfg_distortion","cfg_aspect_lock",
+        "cfg_hpos","cfg_vpos","cfg_hsize","cfg_vsize","cfg_contrast","cfg_brightness",
+        "cfg_saturation","cfg_degauss"};
+    for (int i = 0; i < 18; i++) crt_u_cfg[i] = glGetUniformLocation(crt_program, cfgs[i]);
+
+    /* 1x1 black stub texture for blurbuffer + frametexture */
+    unsigned char black[4] = {0,0,0,0};
+    glGenTextures(1, &crt_stub_tex);
+    glBindTexture(GL_TEXTURE_2D, crt_stub_tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, black);
+
+    crt_time_start = CFAbsoluteTimeGetCurrent();
+}
+
+static void crt_resize_fbo(int w, int h) {
+    if (w == crt_fbo_w && h == crt_fbo_h && crt_fbo) return;
+    if (!crt_fbo) { glGenFramebuffers(1, &crt_fbo); glGenTextures(1, &crt_fbo_tex); }
+    glBindTexture(GL_TEXTURE_2D, crt_fbo_tex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindFramebuffer(GL_FRAMEBUFFER, crt_fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, crt_fbo_tex, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    crt_fbo_w = w; crt_fbo_h = h;
+}
+
+/* Draws a fullscreen quad through the CRT shader, sampling crt_fbo_tex */
+static void crt_apply_pass(int w, int h) {
+    if (!crt_program) return;
+    glUseProgram(crt_program);
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, crt_fbo_tex);
+    glUniform1i(crt_u_backbuffer, 0);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, crt_stub_tex);
+    glUniform1i(crt_u_blurbuffer, 1);
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, crt_stub_tex);
+    glUniform1i(crt_u_frametexture, 2);
+    glActiveTexture(GL_TEXTURE0);
+
+    glUniform1f(crt_u_useframe, 0.0f);
+    glUniform3f(crt_u_modulate, 1.0f, 1.0f, 1.0f);
+    glUniform2f(crt_u_resolution, (float)w, (float)h);
+    float t = (float)(CFAbsoluteTimeGetCurrent() - crt_time_start);
+    glUniform1f(crt_u_time, t);
+    for (int i = 0; i < 18; i++) if (crt_u_cfg[i] >= 0) glUniform1f(crt_u_cfg[i], 0.0f);
+
+    /* fullscreen quad: pos.xy = clip space, pos.zw = UV.
+       V is flipped (0,1 instead of 0,0) because the shader's tsample() does
+       1.0-tc.y internally (assumes image-order data), but our FBO stores in
+       GL-native orientation. Flipping here cancels the shader's flip. */
+    GLfloat verts[] = {
+        -1,-1, 0,1,
+         1,-1, 1,1,
+         1, 1, 1,0,
+        -1, 1, 0,0,
+    };
+    glDisable(GL_BLEND);
+    glDisable(GL_TEXTURE_2D); /* ensure fixed-function TEX0 bind doesn't interfere */
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, 0, verts);
+    glDrawArrays(GL_QUADS, 0, 4);
+    glDisableVertexAttribArray(0);
+
+    glUseProgram(0);
+    glEnable(GL_BLEND); glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+}
+
 static void gl_render(void) {
     scroll_update();
     glow_update();
     int total_vrows = hist_count + term_rows;
     /* scroll_y=0 = bottom (live), scroll_y = hist_count*CELL_H = top of history */
     float view_top_px = (float)(total_vrows - term_rows) * CELL_H - scroll_y;
+
+    /* If CRT enabled, redirect rendering to FBO for post-processing */
+    GLint prev_vp[4] = {0,0,0,0};
+    if (crt_enabled && crt_program) {
+        glGetIntegerv(GL_VIEWPORT, prev_vp);
+        crt_resize_fbo(prev_vp[2], prev_vp[3]);
+        glBindFramebuffer(GL_FRAMEBUFFER, crt_fbo);
+    }
 
     glClearColor(0,0,0,1); glClear(GL_COLOR_BUFFER_BIT);
 
@@ -2394,6 +2648,12 @@ static void gl_render(void) {
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     }
 
+    if (crt_enabled && crt_program) {
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glViewport(prev_vp[0], prev_vp[1], prev_vp[2], prev_vp[3]);
+        crt_apply_pass(prev_vp[2], prev_vp[3]);
+    }
+
     [[NSOpenGLContext currentContext] flushBuffer];
 }
 
@@ -2634,13 +2894,16 @@ static void apply_resize(int new_cols, int new_rows) {
     term_cols = new_cols; term_rows = new_rows;
 
     if (g_net_mode == 2) {
-        /* remote client: just update dimensions and tell server — don't clear grid/history.
-           The server's child will redraw and send new content over the wire. */
+        /* remote client: update local dimensions immediately, but DEBOUNCE the
+           _RESIZE network send. During drag the dimensions change many times
+           per second; only send after they've settled so W7 Claude reflows
+           once per pause instead of once per burst. */
+        extern double g_pending_resize_at;
+        extern int g_pending_resize_cols, g_pending_resize_rows, g_last_sent_cols, g_last_sent_rows;
         scroll_y = 0; scroll_vel = 0; scroll_snapping = 0; scroll_locked = 1;
-        if (g_net_sock != SOCK_INVALID) {
-            char msg[32]; int len = sprintf(msg, "\x1b_RESIZE;%d;%d\x1b\\", term_cols, term_rows);
-            net_write(g_net_sock, msg, len);
-        }
+        g_pending_resize_cols = term_cols;
+        g_pending_resize_rows = term_rows;
+        g_pending_resize_at = CFAbsoluteTimeGetCurrent();
         return;
     }
 
@@ -2832,12 +3095,14 @@ static void menu_cb(int item) {
 - (void)copyHistory:(id)sender;
 - (void)paste:(id)sender;
 - (void)setFontScale:(id)sender;
+- (void)toggleCRT:(id)sender;
 @end
 @implementation DTMenuHandler
 - (void)copyScreen:(id)sender { if (sel_mode) { sel_copy(); sel_clear(); } else copy_screen(); }
 - (void)copyHistory:(id)sender { copy_history(); }
 - (void)paste:(id)sender { paste_from_clipboard(); }
 - (void)setFontScale:(id)sender { font_scale = (int)[sender tag]; }
+- (void)toggleCRT:(id)sender { crt_enabled = !crt_enabled; }
 - (void)setMorsePreset:(id)sender { morse_preset = (int)[sender tag]; }
 - (void)setMorseVol:(id)sender { morse_vol = (int)[sender tag]; }
 - (void)setMorseSpeed:(id)sender { morse_speed = (int)[sender tag]; }
@@ -2865,6 +3130,7 @@ static void menu_cb(int item) {
     else if (act == @selector(setOutputPreset:)) [item setState:(tag==output_preset)?NSControlStateValueOn:NSControlStateValueOff];
     else if (act == @selector(setOutputVol:)) [item setState:(tag==output_vol)?NSControlStateValueOn:NSControlStateValueOff];
     else if (act == @selector(setFontScale:)) [item setState:(tag==font_scale)?NSControlStateValueOn:NSControlStateValueOff];
+    else if (act == @selector(toggleCRT:)) [item setState:crt_enabled?NSControlStateValueOn:NSControlStateValueOff];
     return YES;
 }
 @end
@@ -2924,6 +3190,12 @@ int main(int argc, char **argv) {
             g_connect_addr = argv[++i]; g_net_mode = 2;
         } else if (strcmp(argv[i], "--visible") == 0) {
             g_server_visible = 1;
+        } else if (strcmp(argv[i], "--flowto") == 0 && i+1 < argc) {
+            g_flowto_addr = argv[++i];
+        } else if (strcmp(argv[i], "--agent") == 0 && i+1 < argc) {
+            g_agent_addr = argv[++i];
+        } else if (strcmp(argv[i], "--selftest") == 0) {
+            g_flowto_selftest = 1;
         } else if (strcmp(argv[i], "--") == 0) { i++; break; }
         else break;
     }
@@ -2937,6 +3209,57 @@ int main(int argc, char **argv) {
         default_argv[0] = shell;
         child_cmd = shell;
         child_argv = default_argv;
+    }
+
+    /* ── AGENT MODE: headless RPC server for --flowto clients ─── */
+    if (g_agent_addr) {
+        return flowto_run_agent(g_agent_addr);
+    }
+
+    /* ── DRIVER MODE (--flowto): headless; spawn child with shim,
+           bridge shim RPC calls to remote agent + local dispatch ── */
+    if (g_flowto_addr) {
+        int gw_port = 0;
+        sock_t gw = flowto_bind_gateway(&gw_port);
+        if (gw == SOCK_INVALID) { fprintf(stderr, "flowto: bind failed\n"); return 1; }
+        fprintf(stderr, "flowto: gateway on 127.0.0.1:%d → agent %s\n", gw_port, g_flowto_addr);
+        g_agent_sock = flowto_connect_agent(g_flowto_addr);
+        if (g_agent_sock == SOCK_INVALID) return 1;
+
+        /* spawn child with DUMBTERM_GATEWAY + DUMBTERM_FLOWTO env */
+        char gwEnv[64]; snprintf(gwEnv, sizeof(gwEnv), "DUMBTERM_GATEWAY=127.0.0.1:%d", gw_port);
+        char ftEnv[128]; snprintf(ftEnv, sizeof(ftEnv), "DUMBTERM_FLOWTO=%s", g_flowto_addr);
+        setenv("DUMBTERM_GATEWAY", gwEnv + strlen("DUMBTERM_GATEWAY="), 1);
+        setenv("DUMBTERM_FLOWTO", g_flowto_addr, 1);
+
+        /* child should require the shim. If child_cmd is node, prepend --require */
+        pid_t pid = fork();
+        if (pid == 0) {
+            /* find absolute path of flowto_shim.js next to our executable */
+            char shim_path[1024]; shim_path[0] = 0;
+            uint32_t plen = sizeof(shim_path);
+            _NSGetExecutablePath(shim_path, &plen);
+            char *sl = strrchr(shim_path, '/');
+            if (sl) strcpy(sl + 1, "flowto_shim.js");
+            /* if child is node.exe-ish, inject --require */
+            if (strstr(child_cmd, "node")) {
+                static char *argv_with_require[64];
+                int ac = 0;
+                argv_with_require[ac++] = (char*)child_cmd;
+                argv_with_require[ac++] = "--require";
+                argv_with_require[ac++] = shim_path;
+                for (int j = 1; child_argv[j]; j++) argv_with_require[ac++] = child_argv[j];
+                argv_with_require[ac] = NULL;
+                execvp(child_cmd, argv_with_require);
+            } else {
+                execvp(child_cmd, child_argv);
+            }
+            _exit(127);
+        }
+        /* parent: run gateway */
+        flowto_run_gateway(gw);
+        int status = 0; waitpid(pid, &status, 0);
+        return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
     }
 
     /* ── SERVER MODE: headless (no --visible) ─────────────────── */
@@ -2993,6 +3316,9 @@ int main(int argc, char **argv) {
     NSMenuItem *f3 = [dispMenu addItemWithTitle:@"Font 3× (24×48)" action:@selector(setFontScale:) keyEquivalent:@"3"];
     [f1 setTag:1]; [f2 setTag:2]; [f3 setTag:3];
     [f1 setTarget:g_menu_handler]; [f2 setTarget:g_menu_handler]; [f3 setTarget:g_menu_handler];
+    [dispMenu addItem:[NSMenuItem separatorItem]];
+    NSMenuItem *crtItem = [dispMenu addItemWithTitle:@"CRT Shader" action:@selector(toggleCRT:) keyEquivalent:@""];
+    [crtItem setTarget:g_menu_handler];
     [dispItem setSubmenu:dispMenu];
 
     /* Sounds menu */
@@ -3100,7 +3426,25 @@ int main(int argc, char **argv) {
     if (g_net_mode == 2) {
         static char t[256]; snprintf(t,sizeof(t),"dumbterm [remote:%s]",g_connect_addr); title=t;
     } else if (g_net_mode == 1 && g_server_visible) {
-        static char t[256]; snprintf(t,sizeof(t),"dumbterm [server:%s]",g_listen_addr); title=t;
+        /* Discover all non-loopback IPv4 addresses so user knows where to connect */
+        static char t[512]; char ips[256] = "";
+        struct ifaddrs *ifa = NULL, *p;
+        if (getifaddrs(&ifa) == 0) {
+            for (p = ifa; p; p = p->ifa_next) {
+                if (!p->ifa_addr || p->ifa_addr->sa_family != AF_INET) continue;
+                if (p->ifa_flags & IFF_LOOPBACK) continue;
+                if (!(p->ifa_flags & IFF_UP)) continue;
+                struct sockaddr_in *sa = (struct sockaddr_in*)p->ifa_addr;
+                char ip[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &sa->sin_addr, ip, sizeof(ip));
+                if (ips[0]) strncat(ips, ",", sizeof(ips)-strlen(ips)-1);
+                strncat(ips, ip, sizeof(ips)-strlen(ips)-1);
+            }
+            freeifaddrs(ifa);
+        }
+        if (ips[0]) snprintf(t,sizeof(t),"dumbterm [server :%s on %s]",g_listen_addr,ips);
+        else        snprintf(t,sizeof(t),"dumbterm [server :%s]",g_listen_addr);
+        title=t;
     }
     [window setTitle:[NSString stringWithUTF8String:title]];
     /* snap resizes to cell grid — eliminates sub-cell scaling jitter */
@@ -3140,6 +3484,7 @@ int main(int argc, char **argv) {
         glMatrixMode(GL_MODELVIEW);
     }
 
+    crt_init();
     scroll_locked = 1;
     audio_init();
     if (g_net_mode != 2) platform_spawn(child_cmd, child_argv);
@@ -3240,10 +3585,12 @@ int main(int argc, char **argv) {
                 gen_delete_click();
                 sendToChild("\x7f", 1); return nil;
             }
-            /* enter — Option+Enter or Shift+Enter sends ESC+CR (newline in Claude Code input) */
-            if (raw.length == 1 && [raw characterAtIndex:0] == 13) {
+            /* enter — match by keyCode 36 (Return), not by character, because Option
+               can remap the character. Option+Enter / Shift+Enter send ESC+CR for
+               Claude Code's "newline in input" mode. */
+            if (kc == 36) {
                 BOOL opt = (mods & NSEventModifierFlagOption) != 0;
-                if (opt || shift) sendToChild("\x1b\r", 2); /* ESC CR = Alt+Enter */
+                if (opt || shift) sendToChild("\x1b\r", 2);
                 else sendToChild("\r", 1);
                 return nil;
             }
@@ -3382,6 +3729,21 @@ int main(int argc, char **argv) {
 
         /* trigger output sound if chars were drawn this frame */
         if (output_buf_count > 0) { gen_output_tones(); output_buf_count = 0; }
+
+        /* Flush debounced _RESIZE to remote server once dimensions settled */
+        if (g_net_mode == 2 && g_pending_resize_at > 0 && g_net_sock != SOCK_INVALID) {
+            double since = CFAbsoluteTimeGetCurrent() - g_pending_resize_at;
+            int changed = (g_pending_resize_cols != g_last_sent_cols ||
+                           g_pending_resize_rows != g_last_sent_rows);
+            if (since >= RESIZE_DEBOUNCE_SEC && changed) {
+                char msg[32]; int len = sprintf(msg, "\x1b_RESIZE;%d;%d\x1b\\",
+                    g_pending_resize_cols, g_pending_resize_rows);
+                net_write(g_net_sock, msg, len);
+                g_last_sent_cols = g_pending_resize_cols;
+                g_last_sent_rows = g_pending_resize_rows;
+                g_pending_resize_at = 0;
+            }
+        }
     }];
 
     [NSApp run];

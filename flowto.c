@@ -1,0 +1,416 @@
+/*
+ * flowto.c — "Command flow" remote-execution mode for dumbterm.
+ *
+ * Two roles in this file:
+ *   1. AGENT (--agent PORT):  listens for RPC requests, executes them locally.
+ *   2. DRIVER (--flowto ADDR): spawns child + JS shim, forwards shim's RPC calls
+ *                              to an agent over TCP, multiplexes local "host" too.
+ *
+ * RPC protocol: newline-delimited JSON. Each line is a request or response.
+ *   Request:  {"id":N,"op":"exec","cmd":"ls","cwd":"/tmp"}
+ *   Response: {"id":N,"ok":true,"exit":0,"out":"<base64>","err":"<base64>"}
+ *
+ * Shim talks to driver over a local TCP socket on 127.0.0.1:<gateway_port>,
+ * which the driver tells the child about via env DUMBTERM_GATEWAY.
+ *
+ * Phase 1 scope: exec + ping only. Phase 2 adds fs.*. Phase 3 adds path/env.
+ */
+
+#ifndef FLOWTO_C
+#define FLOWTO_C
+
+/* ── minimal JSON parse + base64 ─────────────────────────────── */
+
+/* base64 encode (caller frees) */
+static char *b64_encode(const unsigned char *data, int len) {
+    static const char T[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    int olen = 4 * ((len + 2) / 3);
+    char *out = (char*)malloc(olen + 1);
+    int i, j = 0;
+    for (i = 0; i < len; i += 3) {
+        unsigned int v = ((unsigned)data[i]) << 16;
+        if (i + 1 < len) v |= ((unsigned)data[i+1]) << 8;
+        if (i + 2 < len) v |= (unsigned)data[i+2];
+        out[j++] = T[(v >> 18) & 0x3F];
+        out[j++] = T[(v >> 12) & 0x3F];
+        out[j++] = (i + 1 < len) ? T[(v >> 6) & 0x3F] : '=';
+        out[j++] = (i + 2 < len) ? T[v & 0x3F] : '=';
+    }
+    out[j] = 0;
+    return out;
+}
+
+/* find a string field: json must contain "key" : "value" (whitespace tolerant). Returns strdup'd value or NULL. */
+static char *json_str(const char *json, const char *key) {
+    char pat[128];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(json, pat);
+    if (!p) return NULL;
+    p += strlen(pat);
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p != ':') return NULL;
+    p++;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p != '"') return NULL;
+    p++;
+    const char *end = p;
+    /* find unescaped closing quote */
+    while (*end) {
+        if (*end == '\\' && end[1]) { end += 2; continue; }
+        if (*end == '"') break;
+        end++;
+    }
+    if (*end != '"') return NULL;
+    int n = end - p;
+    char *out = (char*)malloc(n + 1);
+    /* minimal unescape: only \\ \" \n \t */
+    int oi = 0;
+    const char *s = p;
+    while (s < end) {
+        if (*s == '\\' && s[1]) {
+            char c = s[1];
+            if (c == 'n') out[oi++] = '\n';
+            else if (c == 't') out[oi++] = '\t';
+            else if (c == 'r') out[oi++] = '\r';
+            else out[oi++] = c;
+            s += 2;
+        } else out[oi++] = *s++;
+    }
+    out[oi] = 0;
+    return out;
+}
+
+/* find an integer field: json must contain "key" : 123 (whitespace tolerant). */
+static int json_int(const char *json, const char *key, int dflt) {
+    char pat[128];
+    snprintf(pat, sizeof(pat), "\"%s\"", key);
+    const char *p = strstr(json, pat);
+    if (!p) return dflt;
+    p += strlen(pat);
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p != ':') return dflt;
+    p++;
+    while (*p == ' ' || *p == '\t') p++;
+    return atoi(p);
+}
+
+/* JSON-escape a string into dst (caller ensures dst is big enough: 6*len + 1). */
+static void json_escape(char *dst, const char *src) {
+    char *d = dst;
+    for (; *src; src++) {
+        unsigned char c = (unsigned char)*src;
+        if (c == '"') { *d++='\\'; *d++='"'; }
+        else if (c == '\\') { *d++='\\'; *d++='\\'; }
+        else if (c == '\n') { *d++='\\'; *d++='n'; }
+        else if (c == '\r') { *d++='\\'; *d++='r'; }
+        else if (c == '\t') { *d++='\\'; *d++='t'; }
+        else if (c < 0x20) { d += sprintf(d, "\\u%04x", c); }
+        else *d++ = c;
+    }
+    *d = 0;
+}
+
+/* ── line-buffered JSON reader over a socket ─────────────────── */
+typedef struct {
+    sock_t s;
+    char buf[65536];
+    int used;
+} RpcConn;
+
+/* read one newline-terminated JSON line into msg (zero-terminated).
+   returns length, 0 on close, -1 on error. */
+static int rpc_read_line(RpcConn *c, char *msg, int msg_max) {
+    for (;;) {
+        /* scan for newline in existing buffer */
+        int i;
+        for (i = 0; i < c->used; i++) {
+            if (c->buf[i] == '\n') {
+                int len = i;
+                if (len >= msg_max) len = msg_max - 1;
+                memcpy(msg, c->buf, len);
+                msg[len] = 0;
+                /* shift remainder */
+                memmove(c->buf, c->buf + i + 1, c->used - i - 1);
+                c->used -= i + 1;
+                return len;
+            }
+        }
+        /* need more data */
+        int cap = (int)sizeof(c->buf) - c->used;
+        if (cap <= 0) return -1; /* line too long */
+        int n = recv(c->s, c->buf + c->used, cap, 0);
+        if (n <= 0) return n;
+        c->used += n;
+    }
+}
+
+/* send one JSON line (appends \n) */
+static int rpc_write_line(sock_t s, const char *json) {
+    int n = (int)strlen(json);
+    if (send(s, json, n, 0) != n) return -1;
+    if (send(s, "\n", 1, 0) != 1) return -1;
+    return 0;
+}
+
+/* ── AGENT: execute requests ─────────────────────────────────── */
+
+/* Execute cmd via /bin/sh -c (unix) or cmd.exe /c (Windows), capture stdout+stderr+exit. */
+static void agent_exec(const char *cmd, const char *cwd,
+                       char **out, int *out_len, char **err, int *err_len, int *exit_code) {
+    *out = NULL; *out_len = 0; *err = NULL; *err_len = 0; *exit_code = -1;
+#ifdef _WIN32
+    /* Windows: CreateProcess with stdout+stderr redirected to pipes. TODO: merge. */
+    HANDLE out_rd, out_wr, err_rd, err_wr;
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    CreatePipe(&out_rd, &out_wr, &sa, 0);
+    SetHandleInformation(out_rd, HANDLE_FLAG_INHERIT, 0);
+    CreatePipe(&err_rd, &err_wr, &sa, 0);
+    SetHandleInformation(err_rd, HANDLE_FLAG_INHERIT, 0);
+    STARTUPINFOA si = { sizeof(si) };
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = out_wr; si.hStdError = err_wr; si.hStdInput = NULL;
+    PROCESS_INFORMATION pi = {0};
+    char cmdline[8192];
+    snprintf(cmdline, sizeof(cmdline), "cmd.exe /c %s", cmd);
+    BOOL ok = CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, 0, NULL,
+                             (cwd && *cwd) ? cwd : NULL, &si, &pi);
+    CloseHandle(out_wr); CloseHandle(err_wr);
+    if (!ok) { CloseHandle(out_rd); CloseHandle(err_rd); return; }
+    /* slurp pipes */
+    int out_cap = 4096; *out = (char*)malloc(out_cap);
+    int err_cap = 4096; *err = (char*)malloc(err_cap);
+    DWORD nr;
+    char tmp[4096];
+    while (ReadFile(out_rd, tmp, sizeof(tmp), &nr, NULL) && nr > 0) {
+        if (*out_len + (int)nr > out_cap) { out_cap = (*out_len + nr) * 2; *out = (char*)realloc(*out, out_cap); }
+        memcpy(*out + *out_len, tmp, nr); *out_len += nr;
+    }
+    while (ReadFile(err_rd, tmp, sizeof(tmp), &nr, NULL) && nr > 0) {
+        if (*err_len + (int)nr > err_cap) { err_cap = (*err_len + nr) * 2; *err = (char*)realloc(*err, err_cap); }
+        memcpy(*err + *err_len, tmp, nr); *err_len += nr;
+    }
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD ec = 0; GetExitCodeProcess(pi.hProcess, &ec);
+    *exit_code = (int)ec;
+    CloseHandle(out_rd); CloseHandle(err_rd);
+    CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+#else
+    /* POSIX: pipe + fork + exec sh -c */
+    int outpipe[2], errpipe[2];
+    if (pipe(outpipe) < 0) return;
+    if (pipe(errpipe) < 0) { close(outpipe[0]); close(outpipe[1]); return; }
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(outpipe[0]); close(outpipe[1]);
+        close(errpipe[0]); close(errpipe[1]);
+        return;
+    }
+    if (pid == 0) {
+        /* child */
+        if (cwd && *cwd) { if (chdir(cwd) != 0) { /* ignore */ } }
+        dup2(outpipe[1], 1); dup2(errpipe[1], 2);
+        close(outpipe[0]); close(outpipe[1]);
+        close(errpipe[0]); close(errpipe[1]);
+        execl("/bin/sh", "sh", "-c", cmd, (char*)NULL);
+        _exit(127);
+    }
+    /* parent */
+    close(outpipe[1]); close(errpipe[1]);
+    int out_cap = 4096; *out = (char*)malloc(out_cap);
+    int err_cap = 4096; *err = (char*)malloc(err_cap);
+    char tmp[4096];
+    int nr;
+    /* drain both pipes — naive blocking read serially (fine for small outputs) */
+    while ((nr = read(outpipe[0], tmp, sizeof(tmp))) > 0) {
+        if (*out_len + nr > out_cap) { out_cap = (*out_len + nr) * 2; *out = (char*)realloc(*out, out_cap); }
+        memcpy(*out + *out_len, tmp, nr); *out_len += nr;
+    }
+    while ((nr = read(errpipe[0], tmp, sizeof(tmp))) > 0) {
+        if (*err_len + nr > err_cap) { err_cap = (*err_len + nr) * 2; *err = (char*)realloc(*err, err_cap); }
+        memcpy(*err + *err_len, tmp, nr); *err_len += nr;
+    }
+    close(outpipe[0]); close(errpipe[0]);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    *exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+#endif
+}
+
+/* handle one RPC request on the given connection */
+static void agent_handle_request(sock_t s, const char *req) {
+    char *op = json_str(req, "op");
+    int id = json_int(req, "id", 0);
+    if (!op) { rpc_write_line(s, "{\"ok\":false,\"err\":\"no op\"}"); return; }
+
+    if (strcmp(op, "ping") == 0) {
+        char host[256] = "unknown";
+        gethostname(host, sizeof(host));
+        char msg[512];
+        snprintf(msg, sizeof(msg), "{\"id\":%d,\"ok\":true,\"host\":\"%s\"}", id, host);
+        rpc_write_line(s, msg);
+    } else if (strcmp(op, "exec") == 0) {
+        char *cmd = json_str(req, "cmd");
+        char *cwd = json_str(req, "cwd");
+        char *out = NULL, *err = NULL;
+        int out_len = 0, err_len = 0, exit_code = -1;
+        if (cmd) agent_exec(cmd, cwd, &out, &out_len, &err, &err_len, &exit_code);
+        char *out_b64 = b64_encode((unsigned char*)(out ? out : ""), out_len);
+        char *err_b64 = b64_encode((unsigned char*)(err ? err : ""), err_len);
+        int msg_cap = strlen(out_b64) + strlen(err_b64) + 256;
+        char *msg = (char*)malloc(msg_cap);
+        snprintf(msg, msg_cap, "{\"id\":%d,\"ok\":true,\"exit\":%d,\"out\":\"%s\",\"err\":\"%s\"}",
+                 id, exit_code, out_b64, err_b64);
+        rpc_write_line(s, msg);
+        free(msg); free(out_b64); free(err_b64);
+        free(cmd); free(cwd); free(out); free(err);
+    } else {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "{\"id\":%d,\"ok\":false,\"err\":\"unknown op: %s\"}", id, op);
+        rpc_write_line(s, msg);
+    }
+    free(op);
+}
+
+/* Run as --agent: listen, accept one client, serve RPC forever. */
+static int flowto_run_agent(const char *addr) {
+    sock_init();
+    int port = atoi(addr);
+    char host[64] = "0.0.0.0";
+    const char *colon = strchr(addr, ':');
+    if (colon) {
+        memcpy(host, addr, colon - addr); host[colon - addr] = 0;
+        port = atoi(colon + 1);
+    }
+    sock_t srv = socket(AF_INET, SOCK_STREAM, 0);
+    int opt = 1; setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt));
+    struct sockaddr_in sa = {0};
+    sa.sin_family = AF_INET; sa.sin_port = htons(port);
+    sa.sin_addr.s_addr = inet_addr(host);
+    if (bind(srv, (struct sockaddr*)&sa, sizeof(sa)) < 0) { perror("agent bind"); return 1; }
+    listen(srv, 1);
+    fprintf(stderr, "flowto agent: listening on %s:%d\n", host, port);
+    for (;;) {
+        struct sockaddr_in ca; int calen = sizeof(ca);
+        sock_t c = accept(srv, (struct sockaddr*)&ca, (void*)&calen);
+        if (c == SOCK_INVALID) continue;
+        fprintf(stderr, "flowto agent: client connected\n");
+        RpcConn conn = { c, {0}, 0 };
+        char req[65536];
+        for (;;) {
+            int n = rpc_read_line(&conn, req, sizeof(req));
+            if (n <= 0) break;
+            agent_handle_request(c, req);
+        }
+        sock_close(c);
+        fprintf(stderr, "flowto agent: client disconnected\n");
+    }
+}
+
+/* ── DRIVER: gateway for child's JS shim ─────────────────────
+   The driver opens a local TCP gateway. It tells the spawned child via
+   DUMBTERM_GATEWAY env var. The shim (--require _shim.js) opens a client
+   socket to the gateway. Shim sends JSON-line RPC requests; driver routes
+   them:
+     - host=="local" → agent_handle_request locally
+     - host=="<remote>" → forward to the configured agent via a second socket.
+   One gateway accept, then serve forever. */
+
+static sock_t g_agent_sock = SOCK_INVALID; /* driver → agent connection */
+
+/* Connect to remote agent; strdup'd errors to stderr. Returns sock or SOCK_INVALID. */
+static sock_t flowto_connect_agent(const char *addr) {
+    sock_init();
+    char host[256] = "127.0.0.1";
+    int port = 0;
+    const char *colon = strrchr(addr, ':');
+    if (colon) {
+        memcpy(host, addr, colon - addr); host[colon - addr] = 0;
+        port = atoi(colon + 1);
+    } else {
+        port = atoi(addr);
+    }
+    struct sockaddr_in sa = {0};
+    sa.sin_family = AF_INET; sa.sin_port = htons(port);
+    struct hostent *he = gethostbyname(host);
+    if (he) memcpy(&sa.sin_addr, he->h_addr_list[0], he->h_length);
+    else sa.sin_addr.s_addr = inet_addr(host);
+    sock_t s = socket(AF_INET, SOCK_STREAM, 0);
+    if (connect(s, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
+        fprintf(stderr, "flowto: can't connect to agent at %s:%d: %s\n", host, port, strerror(errno));
+        return SOCK_INVALID;
+    }
+    fprintf(stderr, "flowto: connected to agent at %s:%d\n", host, port);
+    return s;
+}
+
+/* Forward an exec request to the remote agent, return response to shim. */
+static void flowto_forward_to_agent(sock_t shim, const char *req) {
+    if (g_agent_sock == SOCK_INVALID) {
+        int id = json_int(req, "id", 0);
+        char msg[256];
+        snprintf(msg, sizeof(msg), "{\"id\":%d,\"ok\":false,\"err\":\"no agent connected\"}", id);
+        rpc_write_line(shim, msg);
+        return;
+    }
+    rpc_write_line(g_agent_sock, req);
+    /* read one response line from agent and forward to shim */
+    static RpcConn ac = { SOCK_INVALID, {0}, 0 };
+    if (ac.s != g_agent_sock) { ac.s = g_agent_sock; ac.used = 0; }
+    char resp[65536];
+    int n = rpc_read_line(&ac, resp, sizeof(resp));
+    if (n > 0) rpc_write_line(shim, resp);
+    else {
+        int id = json_int(req, "id", 0);
+        char msg[256];
+        snprintf(msg, sizeof(msg), "{\"id\":%d,\"ok\":false,\"err\":\"agent read failed\"}", id);
+        rpc_write_line(shim, msg);
+        sock_close(g_agent_sock); g_agent_sock = SOCK_INVALID;
+    }
+}
+
+/* Handle one request from the shim: dispatch by host field. */
+static void flowto_dispatch(sock_t shim, const char *req) {
+    char *host = json_str(req, "host");
+    /* default to remote if --flowto given, else local */
+    int to_remote = g_flowto_addr && (!host || strcmp(host, "local") != 0);
+    if (to_remote) flowto_forward_to_agent(shim, req);
+    else           agent_handle_request(shim, req);
+    free(host);
+}
+
+/* Run the shim gateway loop: accept one client, serve requests forever.
+   gateway_port is the bound TCP port. Returns when shim disconnects. */
+static void flowto_run_gateway(sock_t gateway) {
+    struct sockaddr_in ca; int calen = sizeof(ca);
+    sock_t shim = accept(gateway, (struct sockaddr*)&ca, (void*)&calen);
+    if (shim == SOCK_INVALID) return;
+    fprintf(stderr, "flowto: shim connected\n");
+    RpcConn conn = { shim, {0}, 0 };
+    char req[65536];
+    for (;;) {
+        int n = rpc_read_line(&conn, req, sizeof(req));
+        if (n <= 0) break;
+        flowto_dispatch(shim, req);
+    }
+    sock_close(shim);
+    fprintf(stderr, "flowto: shim disconnected\n");
+}
+
+/* Bind a free gateway port on 127.0.0.1. Returns (sock, port) or (-1, 0). */
+static sock_t flowto_bind_gateway(int *out_port) {
+    sock_init();
+    sock_t srv = socket(AF_INET, SOCK_STREAM, 0);
+    int opt = 1; setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt));
+    struct sockaddr_in sa = {0};
+    sa.sin_family = AF_INET;
+    sa.sin_port = 0; /* any free port */
+    sa.sin_addr.s_addr = inet_addr("127.0.0.1");
+    if (bind(srv, (struct sockaddr*)&sa, sizeof(sa)) < 0) { *out_port = 0; return SOCK_INVALID; }
+    int alen = sizeof(sa);
+    if (getsockname(srv, (struct sockaddr*)&sa, (void*)&alen) < 0) { *out_port = 0; sock_close(srv); return SOCK_INVALID; }
+    listen(srv, 1);
+    *out_port = ntohs(sa.sin_port);
+    return srv;
+}
+
+#endif /* FLOWTO_C */
