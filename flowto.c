@@ -174,6 +174,12 @@ static void agent_exec(const char *cmd, const char *cwd,
     snprintf(cmdline, sizeof(cmdline), "cmd.exe /c %s", cmd);
     BOOL ok = CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, 0, NULL,
                              (cwd && *cwd) ? cwd : NULL, &si, &pi);
+    if (!ok && cwd && *cwd) {
+        /* cwd may be a foreign-platform path (e.g. Mac sending "/Users/..."
+           to a Windows agent). Retry without cwd — use agent's default. */
+        ok = CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, 0, NULL,
+                            NULL, &si, &pi);
+    }
     CloseHandle(out_wr); CloseHandle(err_wr);
     if (!ok) { CloseHandle(out_rd); CloseHandle(err_rd); return; }
     /* slurp pipes */
