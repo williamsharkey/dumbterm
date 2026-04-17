@@ -154,35 +154,52 @@ static void json_escape(char *dst, const char *src) {
 }
 
 /* ── line-buffered JSON reader over a socket ─────────────────── */
+/* Dynamic growing buffer. In-place null-terminate; caller uses immediately. */
 typedef struct {
     sock_t s;
-    char buf[65536];
+    char *buf;
+    int cap;
     int used;
+    int last_line_len; /* bytes returned last, to consume on next call */
 } RpcConn;
 
-/* read one newline-terminated JSON line into msg (zero-terminated).
-   returns length, 0 on close, -1 on error. */
-static int rpc_read_line(RpcConn *c, char *msg, int msg_max) {
+static void rpc_conn_init(RpcConn *c, sock_t s) {
+    c->s = s; c->cap = 65536; c->buf = (char*)malloc(c->cap); c->used = 0; c->last_line_len = 0;
+}
+static void rpc_conn_free(RpcConn *c) {
+    if (c->buf) free(c->buf);
+    c->buf = NULL; c->cap = c->used = c->last_line_len = 0;
+}
+
+/* Read one newline-terminated line. On success: null-terminate in place,
+   return pointer valid until next rpc_read_line call on the same conn. */
+static char *rpc_read_line(RpcConn *c, int *out_len) {
+    /* consume previous line: shift bytes after "last_line_len + 1 (\n)" to start */
+    if (c->last_line_len > 0) {
+        int consumed = c->last_line_len + 1;
+        if (c->used > consumed) {
+            memmove(c->buf, c->buf + consumed, c->used - consumed);
+            c->used -= consumed;
+        } else c->used = 0;
+        c->last_line_len = 0;
+    }
     for (;;) {
-        /* scan for newline in existing buffer */
         int i;
         for (i = 0; i < c->used; i++) {
             if (c->buf[i] == '\n') {
-                int len = i;
-                if (len >= msg_max) len = msg_max - 1;
-                memcpy(msg, c->buf, len);
-                msg[len] = 0;
-                /* shift remainder */
-                memmove(c->buf, c->buf + i + 1, c->used - i - 1);
-                c->used -= i + 1;
-                return len;
+                c->buf[i] = 0;
+                *out_len = i;
+                c->last_line_len = i;
+                return c->buf;
             }
         }
-        /* need more data */
-        int cap = (int)sizeof(c->buf) - c->used;
-        if (cap <= 0) return -1; /* line too long */
-        int n = recv(c->s, c->buf + c->used, cap, 0);
-        if (n <= 0) return n;
+        if (c->used >= c->cap) {
+            c->cap *= 2;
+            c->buf = (char*)realloc(c->buf, c->cap);
+        }
+        int room = c->cap - c->used;
+        int n = recv(c->s, c->buf + c->used, room, 0);
+        if (n <= 0) { *out_len = n; return NULL; }
         c->used += n;
     }
 }
@@ -451,13 +468,14 @@ static int flowto_run_agent(const char *addr) {
         sock_t c = accept(srv, (struct sockaddr*)&ca, (void*)&calen);
         if (c == SOCK_INVALID) continue;
         fprintf(stderr, "flowto agent: client connected\n");
-        RpcConn conn = { c, {0}, 0 };
-        char req[65536];
+        RpcConn conn; rpc_conn_init(&conn, c);
         for (;;) {
-            int n = rpc_read_line(&conn, req, sizeof(req));
-            if (n <= 0) break;
+            int n = 0;
+            char *req = rpc_read_line(&conn, &n);
+            if (!req || n <= 0) break;
             agent_handle_request(c, req);
         }
+        rpc_conn_free(&conn);
         sock_close(c);
         fprintf(stderr, "flowto agent: client disconnected\n");
     }
@@ -510,12 +528,16 @@ static void flowto_forward_to_agent(sock_t shim, const char *req) {
         return;
     }
     rpc_write_line(g_agent_sock, req);
-    /* read one response line from agent and forward to shim */
-    static RpcConn ac = { SOCK_INVALID, {0}, 0 };
-    if (ac.s != g_agent_sock) { ac.s = g_agent_sock; ac.used = 0; }
-    char resp[65536];
-    int n = rpc_read_line(&ac, resp, sizeof(resp));
-    if (n > 0) rpc_write_line(shim, resp);
+    /* read one response line from agent and forward to shim. Keep one
+       persistent RpcConn per agent connection (reset when socket changes). */
+    static RpcConn ac = { SOCK_INVALID, NULL, 0, 0, 0 };
+    if (ac.s != g_agent_sock) {
+        if (ac.buf) rpc_conn_free(&ac);
+        rpc_conn_init(&ac, g_agent_sock);
+    }
+    int n = 0;
+    char *resp = rpc_read_line(&ac, &n);
+    if (resp && n > 0) rpc_write_line(shim, resp);
     else {
         int id = json_int(req, "id", 0);
         char msg[256];
@@ -542,13 +564,14 @@ static void flowto_run_gateway(sock_t gateway) {
     sock_t shim = accept(gateway, (struct sockaddr*)&ca, (void*)&calen);
     if (shim == SOCK_INVALID) return;
     fprintf(stderr, "flowto: shim connected\n");
-    RpcConn conn = { shim, {0}, 0 };
-    char req[65536];
+    RpcConn conn; rpc_conn_init(&conn, shim);
     for (;;) {
-        int n = rpc_read_line(&conn, req, sizeof(req));
-        if (n <= 0) break;
+        int n = 0;
+        char *req = rpc_read_line(&conn, &n);
+        if (!req || n <= 0) break;
         flowto_dispatch(shim, req);
     }
+    rpc_conn_free(&conn);
     sock_close(shim);
     fprintf(stderr, "flowto: shim disconnected\n");
 }

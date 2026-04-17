@@ -254,6 +254,144 @@ test('stderr captured separately from stdout', async () => {
     return 'out=OUT, err=ERR';
 });
 
+// ── Stress / edge cases ──────────────────────────────────────
+
+test('50 parallel fs.stat calls — RPC ordering under concurrency', async () => {
+    // Seed 50 files, then stat them concurrently. Every response must
+    // match the correct request (tests id-keyed Map in shim.rpcCall).
+    const files = [];
+    for (let i = 0; i < 50; i++) {
+        const p = `/cloud/dumbterm/parallel_${i}.txt`;
+        await writeFile(p, `value-${i}\n`);
+        files.push(p);
+    }
+    const results = await Promise.all(files.map(p => stat(p)));
+    for (let i = 0; i < 50; i++) {
+        const expect = `value-${i}\n`.length;
+        if (results[i].size !== expect) throw new Error(`idx ${i}: expected ${expect}, got ${results[i].size}`);
+    }
+    for (const p of files) await unlink(p);
+    return '50 parallel stats returned correctly-sized results';
+});
+
+test('1MB binary round-trip', async () => {
+    const p = '/cloud/dumbterm/tester_big.bin';
+    const big = Buffer.alloc(1024 * 1024);
+    for (let i = 0; i < big.length; i++) big[i] = i & 0xFF;
+    await writeFile(p, big);
+    const back = await readFile(p);
+    if (back.length !== big.length) throw new Error(`len ${back.length} vs ${big.length}`);
+    for (let i = 0; i < big.length; i += 4096) if (back[i] !== big[i]) throw new Error(`byte ${i} mismatch`);
+    await unlink(p);
+    return `${big.length} bytes round-tripped intact`;
+});
+
+test('20 sequential execs — ordering preserved', async () => {
+    const results = [];
+    for (let i = 0; i < 20; i++) {
+        const r = await exec(`node -e "console.log(${i})"`);
+        results.push(parseInt(r.out.trim()));
+    }
+    for (let i = 0; i < 20; i++) if (results[i] !== i) throw new Error(`idx ${i} got ${results[i]}`);
+    return '20 execs returned 0..19 in order';
+});
+
+test('unicode filename + content', async () => {
+    const p = '/cloud/dumbterm/tester_héllo_✨.txt';
+    const content = 'Héllo 世界 ✨ 🎉\n';
+    await writeFile(p, content);
+    const back = await readFile(p, 'utf8');
+    if (back !== content) throw new Error(`got: ${JSON.stringify(back)}`);
+    await unlink(p);
+    return `${content.length} unicode chars round-tripped`;
+});
+
+test('empty file round-trip', async () => {
+    const p = '/cloud/dumbterm/tester_empty.txt';
+    await writeFile(p, '');
+    const s = await stat(p);
+    if (s.size !== 0) throw new Error(`size ${s.size}`);
+    const back = await readFile(p, 'utf8');
+    if (back !== '') throw new Error(`got: ${JSON.stringify(back)}`);
+    await unlink(p);
+    return 'zero-byte file handled';
+});
+
+test('nested subdir: mkdir → write inside → readdir → cleanup', async () => {
+    const dir = '/cloud/dumbterm/tester_sub';
+    try { await fs.promises.mkdir(dir); } catch (e) { /* might exist */ }
+    const inner = dir + '/inner.txt';
+    await writeFile(inner, 'nested data\n');
+    const entries = await fs.promises.readdir(dir);
+    if (!entries.includes('inner.txt')) throw new Error(`entries: ${entries.join(',')}`);
+    const back = await readFile(inner, 'utf8');
+    if (back !== 'nested data\n') throw new Error(`got: ${JSON.stringify(back)}`);
+    await unlink(inner);
+    return `dir created, contained ${entries.length} entry`;
+});
+
+test('rapid host switching (10 switches)', async () => {
+    for (let i = 0; i < 5; i++) {
+        let r = await exec('dumbterm-host local');
+        if (!r.out.includes('active host: local')) throw new Error(`switch ${i}-local: ${r.out}`);
+        r = await exec('dumbterm-host remote');
+        if (!r.out.includes('active host: remote')) throw new Error(`switch ${i}-remote: ${r.out}`);
+    }
+    return '10 switches completed, final state: remote';
+});
+
+test('exec with shell metacharacters in payload (quoted node -e)', async () => {
+    // Node's -e string contains dollar signs, semicolons, pipes as plain chars
+    const r = await exec(`node -e "console.log('one|two;three$four')"`);
+    if (r.out.trim() !== 'one|two;three$four') throw new Error(`got: ${JSON.stringify(r.out)}`);
+    return 'metachars passed through as data';
+});
+
+test('large stdout capture (100 KB)', async () => {
+    // Emit ~100KB of output and make sure we get it all
+    const r = await exec(`node -e "for(let i=0;i<2000;i++) console.log('line '+i+' '.repeat(40))"`);
+    // normalize \r\n → \n (W7 default line endings)
+    const lines = r.out.replace(/\r/g, '').split('\n').filter(Boolean);
+    if (lines.length !== 2000) throw new Error(`expected 2000 lines, got ${lines.length}`);
+    // cmd is: 'line '+i+' '.repeat(40), so for i=0: "line " + "0" + 40 spaces = "line 0" + 40 spaces
+    const expectFirst = 'line 0' + ' '.repeat(40);
+    const expectLast  = 'line 1999' + ' '.repeat(40);
+    if (lines[0] !== expectFirst) throw new Error(`first line: ${JSON.stringify(lines[0])}`);
+    if (lines[1999] !== expectLast) throw new Error(`last line: ${JSON.stringify(lines[1999])}`);
+    return `${lines.length} lines, ${r.out.length} bytes captured intact`;
+});
+
+test('chained: mkdir → 3x write → readdir → 3x stat → 3x read → cleanup', async () => {
+    const dir = '/cloud/dumbterm/tester_chain';
+    try { await fs.promises.mkdir(dir); } catch (e) {}
+    for (let i = 0; i < 3; i++) await writeFile(`${dir}/f${i}.txt`, `content-${i}`);
+    const entries = await fs.promises.readdir(dir);
+    if (entries.length < 3) throw new Error(`expected 3+ entries, got ${entries.length}: ${entries.join(',')}`);
+    const sizes = await Promise.all([0,1,2].map(i => stat(`${dir}/f${i}.txt`).then(s => s.size)));
+    for (let i = 0; i < 3; i++) {
+        const expected = `content-${i}`.length;
+        if (sizes[i] !== expected) throw new Error(`f${i}: expected ${expected}, got ${sizes[i]}`);
+    }
+    const contents = await Promise.all([0,1,2].map(i => readFile(`${dir}/f${i}.txt`, 'utf8')));
+    for (let i = 0; i < 3; i++) if (contents[i] !== `content-${i}`) throw new Error(`f${i} mismatch: ${contents[i]}`);
+    for (let i = 0; i < 3; i++) await unlink(`${dir}/f${i}.txt`);
+    return '3 files created, listed, stat-ed, read, and removed';
+});
+
+test('exec stdout with embedded newlines preserved', async () => {
+    const r = await exec(`node -e "console.log('a\\nb\\nc')"`);
+    const parts = r.out.trim().split('\n');
+    if (parts.length !== 3 || parts[0] !== 'a' || parts[1] !== 'b' || parts[2] !== 'c')
+        throw new Error(JSON.stringify(r.out));
+    return '3 lines preserved';
+});
+
+test('exec with no output returns empty string', async () => {
+    const r = await exec(`node -e ""`);
+    if (r.out !== '') throw new Error(`expected empty, got: ${JSON.stringify(r.out)}`);
+    return 'empty stdout = ""';
+});
+
 // Cleanup tests
 test('cleanup cloud test files', async () => {
     await unlink('/cloud/dumbterm/tester_smoke.txt');
