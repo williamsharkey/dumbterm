@@ -302,6 +302,151 @@ static void agent_exec(const char *cmd, const char *cwd,
 #endif
 }
 
+/* Stream one message to the socket ({id, stream:"out|err", data:base64}).
+   We use send() direct; line-terminated JSON so shim's reader can split. */
+static void agent_stream(sock_t s, int id, const char *stream_name,
+                         const unsigned char *data, int len) {
+    if (len <= 0) return;
+    char *b64 = b64_encode(data, len);
+    int cap = strlen(b64) + 128;
+    char *msg = (char*)malloc(cap);
+    snprintf(msg, cap, "{\"id\":%d,\"stream\":\"%s\",\"data\":\"%s\"}", id, stream_name, b64);
+    rpc_write_line(s, msg);
+    free(msg); free(b64);
+}
+
+/* spawn a child and stream its stdout/stderr as JSON-line messages.
+   Blocks until the child exits, then sends {id, exit:N}.
+   During this call the main loop doesn't pump other requests. */
+static void agent_spawn_streaming(sock_t s, int id, const char *cmd,
+                                  const char *args_json, const char *cwd) {
+#ifdef _WIN32
+    /* Build cmdline: "cmd.exe /c <cmd> <args>". args_json is a JSON array; we
+       parse minimally — for Phase 5 just pass cmd through as-is (user can
+       include args in cmd string). */
+    (void)args_json;
+    HANDLE out_rd, out_wr, err_rd, err_wr;
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    CreatePipe(&out_rd, &out_wr, &sa, 0);
+    SetHandleInformation(out_rd, HANDLE_FLAG_INHERIT, 0);
+    CreatePipe(&err_rd, &err_wr, &sa, 0);
+    SetHandleInformation(err_rd, HANDLE_FLAG_INHERIT, 0);
+    STARTUPINFOA si = { sizeof(si) };
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdOutput = out_wr; si.hStdError = err_wr; si.hStdInput = NULL;
+    PROCESS_INFORMATION pi = {0};
+    char cmdline[8192];
+    snprintf(cmdline, sizeof(cmdline), "cmd.exe /c %s", cmd);
+    BOOL ok = CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, 0, NULL,
+                             (cwd && *cwd) ? cwd : NULL, &si, &pi);
+    if (!ok && cwd && *cwd) {
+        ok = CreateProcessA(NULL, cmdline, NULL, NULL, TRUE, 0, NULL, NULL, &si, &pi);
+    }
+    CloseHandle(out_wr); CloseHandle(err_wr);
+    if (!ok) {
+        CloseHandle(out_rd); CloseHandle(err_rd);
+        char msg[256]; snprintf(msg, sizeof(msg), "{\"id\":%d,\"exit\":-1,\"err\":\"spawn failed\"}", id);
+        rpc_write_line(s, msg); return;
+    }
+    /* announce pid */
+    { char msg[128]; snprintf(msg, sizeof(msg), "{\"id\":%d,\"ok\":true,\"pid\":%u}", id, (unsigned)pi.dwProcessId);
+      rpc_write_line(s, msg); }
+    /* poll loop: peek pipes, read + send; check if process exited */
+    unsigned char buf[4096];
+    for (;;) {
+        DWORD avail = 0;
+        if (PeekNamedPipe(out_rd, NULL, 0, NULL, &avail, NULL) && avail > 0) {
+            DWORD n = 0; if (ReadFile(out_rd, buf, avail < sizeof(buf) ? avail : sizeof(buf), &n, NULL) && n > 0)
+                agent_stream(s, id, "out", buf, (int)n);
+        }
+        if (PeekNamedPipe(err_rd, NULL, 0, NULL, &avail, NULL) && avail > 0) {
+            DWORD n = 0; if (ReadFile(err_rd, buf, avail < sizeof(buf) ? avail : sizeof(buf), &n, NULL) && n > 0)
+                agent_stream(s, id, "err", buf, (int)n);
+        }
+        DWORD wr = WaitForSingleObject(pi.hProcess, 30); /* 30ms poll interval */
+        if (wr == WAIT_OBJECT_0) {
+            /* drain remaining */
+            for (;;) {
+                avail = 0; if (!PeekNamedPipe(out_rd, NULL, 0, NULL, &avail, NULL) || avail == 0) break;
+                DWORD n = 0; if (!ReadFile(out_rd, buf, avail < sizeof(buf) ? avail : sizeof(buf), &n, NULL) || n == 0) break;
+                agent_stream(s, id, "out", buf, (int)n);
+            }
+            for (;;) {
+                avail = 0; if (!PeekNamedPipe(err_rd, NULL, 0, NULL, &avail, NULL) || avail == 0) break;
+                DWORD n = 0; if (!ReadFile(err_rd, buf, avail < sizeof(buf) ? avail : sizeof(buf), &n, NULL) || n == 0) break;
+                agent_stream(s, id, "err", buf, (int)n);
+            }
+            break;
+        }
+    }
+    DWORD ec = 0; GetExitCodeProcess(pi.hProcess, &ec);
+    CloseHandle(out_rd); CloseHandle(err_rd); CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
+    char msg[128]; snprintf(msg, sizeof(msg), "{\"id\":%d,\"exit\":%d}", id, (int)ec);
+    rpc_write_line(s, msg);
+#else
+    /* POSIX: pipes + fork + exec sh -c, then poll using select() */
+    (void)args_json;
+    int outpipe[2], errpipe[2];
+    if (pipe(outpipe) < 0 || pipe(errpipe) < 0) {
+        char msg[256]; snprintf(msg, sizeof(msg), "{\"id\":%d,\"exit\":-1,\"err\":\"pipe failed\"}", id);
+        rpc_write_line(s, msg); return;
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        char msg[256]; snprintf(msg, sizeof(msg), "{\"id\":%d,\"exit\":-1,\"err\":\"fork failed\"}", id);
+        rpc_write_line(s, msg); return;
+    }
+    if (pid == 0) {
+        if (cwd && *cwd) { (void)chdir(cwd); }
+        dup2(outpipe[1], 1); dup2(errpipe[1], 2);
+        close(outpipe[0]); close(outpipe[1]); close(errpipe[0]); close(errpipe[1]);
+        execl("/bin/sh", "sh", "-c", cmd, (char*)NULL);
+        _exit(127);
+    }
+    close(outpipe[1]); close(errpipe[1]);
+    int outfd = outpipe[0], errfd = errpipe[0];
+    /* non-blocking reads */
+    int fl = fcntl(outfd, F_GETFL); fcntl(outfd, F_SETFL, fl | O_NONBLOCK);
+    fl = fcntl(errfd, F_GETFL); fcntl(errfd, F_SETFL, fl | O_NONBLOCK);
+    { char msg[128]; snprintf(msg, sizeof(msg), "{\"id\":%d,\"ok\":true,\"pid\":%d}", id, (int)pid);
+      rpc_write_line(s, msg); }
+    unsigned char buf[4096];
+    int out_open = 1, err_open = 1, exited = 0, exit_code = -1;
+    while (out_open || err_open || !exited) {
+        fd_set rfds; FD_ZERO(&rfds);
+        int maxfd = -1;
+        if (out_open) { FD_SET(outfd, &rfds); if (outfd > maxfd) maxfd = outfd; }
+        if (err_open) { FD_SET(errfd, &rfds); if (errfd > maxfd) maxfd = errfd; }
+        struct timeval tv = {0, 50000}; /* 50ms */
+        if (maxfd >= 0) select(maxfd + 1, &rfds, NULL, NULL, &tv);
+        else usleep(50000);
+        if (out_open && FD_ISSET(outfd, &rfds)) {
+            int n = read(outfd, buf, sizeof(buf));
+            if (n > 0) agent_stream(s, id, "out", buf, n);
+            else if (n == 0) out_open = 0;
+            else if (errno != EAGAIN && errno != EWOULDBLOCK) out_open = 0;
+        }
+        if (err_open && FD_ISSET(errfd, &rfds)) {
+            int n = read(errfd, buf, sizeof(buf));
+            if (n > 0) agent_stream(s, id, "err", buf, n);
+            else if (n == 0) err_open = 0;
+            else if (errno != EAGAIN && errno != EWOULDBLOCK) err_open = 0;
+        }
+        if (!exited) {
+            int status;
+            pid_t r = waitpid(pid, &status, WNOHANG);
+            if (r == pid) {
+                exited = 1;
+                exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+            }
+        }
+    }
+    close(outfd); close(errfd);
+    char msg[128]; snprintf(msg, sizeof(msg), "{\"id\":%d,\"exit\":%d}", id, exit_code);
+    rpc_write_line(s, msg);
+#endif
+}
+
 /* handle one RPC request on the given connection */
 static void agent_handle_request(sock_t s, const char *req) {
     char *op = json_str(req, "op");
@@ -321,18 +466,86 @@ static void agent_handle_request(sock_t s, const char *req) {
         if (!getcwd(cwd, sizeof(cwd))) strcpy(cwd, ".");
 #ifdef _WIN32
         const char *plat = "win32";
-        const char *sep = "\\\\"; /* backslash, escaped for JSON */
+        const char *sep = "\\\\";
 #else
         const char *plat = "darwin";
         const char *sep = "/";
 #endif
+        /* Build env JSON object */
+        int env_cap = 16384; char *env_json = (char*)malloc(env_cap);
+        int env_pos = 0;
+        env_pos += snprintf(env_json + env_pos, env_cap - env_pos, "{");
+#ifdef _WIN32
+        LPCH env_block = GetEnvironmentStringsA();
+        if (env_block) {
+            int first = 1;
+            for (LPCH p = env_block; *p; ) {
+                if (*p != '=') {
+                    const char *eq = strchr(p, '=');
+                    if (eq) {
+                        int kl = eq - p;
+                        char key[512], val_esc[8192], key_esc[1024];
+                        if (kl < (int)sizeof(key) - 1) {
+                            memcpy(key, p, kl); key[kl] = 0;
+                            json_escape(key_esc, key);
+                            json_escape(val_esc, eq + 1);
+                            int need = strlen(key_esc) + strlen(val_esc) + 16;
+                            if (env_pos + need > env_cap) {
+                                env_cap = (env_pos + need) * 2;
+                                env_json = (char*)realloc(env_json, env_cap);
+                            }
+                            env_pos += snprintf(env_json + env_pos, env_cap - env_pos,
+                                "%s\"%s\":\"%s\"", first ? "" : ",", key_esc, val_esc);
+                            first = 0;
+                        }
+                    }
+                }
+                p += strlen(p) + 1;
+            }
+            FreeEnvironmentStringsA(env_block);
+        }
+#else
+        extern char **environ;
+        int first = 1;
+        for (char **e = environ; *e; e++) {
+            const char *eq = strchr(*e, '=');
+            if (!eq) continue;
+            int kl = eq - *e;
+            char key[512], val_esc[8192], key_esc[1024];
+            if (kl >= (int)sizeof(key)) continue;
+            memcpy(key, *e, kl); key[kl] = 0;
+            json_escape(key_esc, key);
+            json_escape(val_esc, eq + 1);
+            int need = strlen(key_esc) + strlen(val_esc) + 16;
+            if (env_pos + need > env_cap) {
+                env_cap = (env_pos + need) * 2;
+                env_json = (char*)realloc(env_json, env_cap);
+            }
+            env_pos += snprintf(env_json + env_pos, env_cap - env_pos,
+                "%s\"%s\":\"%s\"", first ? "" : ",", key_esc, val_esc);
+            first = 0;
+        }
+#endif
+        env_pos += snprintf(env_json + env_pos, env_cap - env_pos, "}");
+
         char cwd_esc[4096]; json_escape(cwd_esc, cwd);
         char host_esc[512]; json_escape(host_esc, hostname);
-        char msg[8192];
-        snprintf(msg, sizeof(msg),
-            "{\"id\":%d,\"ok\":true,\"hostname\":\"%s\",\"cwd\":\"%s\",\"platform\":\"%s\",\"sep\":\"%s\"}",
-            id, host_esc, cwd_esc, plat, sep);
+        int msg_cap = env_pos + 1024;
+        char *msg = (char*)malloc(msg_cap);
+        snprintf(msg, msg_cap,
+            "{\"id\":%d,\"ok\":true,\"hostname\":\"%s\",\"cwd\":\"%s\",\"platform\":\"%s\",\"sep\":\"%s\",\"env\":%s}",
+            id, host_esc, cwd_esc, plat, sep, env_json);
         rpc_write_line(s, msg);
+        free(msg); free(env_json);
+    } else if (strcmp(op, "spawn") == 0) {
+        char *cmd = json_str(req, "cmd");
+        char *cwd = json_str(req, "cwd");
+        if (cmd) agent_spawn_streaming(s, id, cmd, NULL, cwd);
+        else {
+            char msg[128]; snprintf(msg, sizeof(msg), "{\"id\":%d,\"exit\":-1,\"err\":\"no cmd\"}", id);
+            rpc_write_line(s, msg);
+        }
+        free(cmd); free(cwd);
     } else if (strcmp(op, "exec") == 0) {
         char *cmd = json_str(req, "cmd");
         char *cwd = json_str(req, "cwd");
@@ -547,22 +760,33 @@ static void flowto_forward_to_agent(sock_t shim, const char *req) {
         return;
     }
     rpc_write_line(g_agent_sock, req);
-    /* read one response line from agent and forward to shim. Keep one
-       persistent RpcConn per agent connection (reset when socket changes). */
+    /* Persistent RpcConn to the agent. Read response lines until we see a
+       terminal message. For exec/fs/ping/host_info: one response with "ok".
+       For spawn: many stream messages + a final one with "exit". */
     static RpcConn ac = { SOCK_INVALID, NULL, 0, 0, 0 };
     if (ac.s != g_agent_sock) {
         if (ac.buf) rpc_conn_free(&ac);
         rpc_conn_init(&ac, g_agent_sock);
     }
-    int n = 0;
-    char *resp = rpc_read_line(&ac, &n);
-    if (resp && n > 0) rpc_write_line(shim, resp);
-    else {
-        int id = json_int(req, "id", 0);
-        char msg[256];
-        snprintf(msg, sizeof(msg), "{\"id\":%d,\"ok\":false,\"err\":\"agent read failed\"}", id);
-        rpc_write_line(shim, msg);
-        sock_close(g_agent_sock); g_agent_sock = SOCK_INVALID;
+    /* Is this a spawn request? If so, loop until we see "exit". */
+    char *op = json_str(req, "op");
+    int is_spawn = op && strcmp(op, "spawn") == 0;
+    free(op);
+    for (;;) {
+        int n = 0;
+        char *resp = rpc_read_line(&ac, &n);
+        if (!resp || n <= 0) {
+            int id = json_int(req, "id", 0);
+            char msg[256];
+            snprintf(msg, sizeof(msg), "{\"id\":%d,\"ok\":false,\"err\":\"agent read failed\"}", id);
+            rpc_write_line(shim, msg);
+            sock_close(g_agent_sock); g_agent_sock = SOCK_INVALID;
+            return;
+        }
+        rpc_write_line(shim, resp);
+        if (!is_spawn) return;
+        /* spawn: consume stream messages + first one with "exit" ends */
+        if (strstr(resp, "\"exit\":")) return;
     }
 }
 

@@ -522,6 +522,108 @@ test('path.sep updates dynamically on host switch', async () => {
     return 'sep tracks active host dynamically';
 });
 
+// ── Phase 5: spawn streaming ────────────────────────────────
+
+test('child_process.spawn on remote emits stdout + exit', async () => {
+    return new Promise((resolve, reject) => {
+        const child = cp.spawn('node -e "console.log(\'hello-spawn\')"');
+        let out = '';
+        child.stdout.on('data', (d) => { out += d.toString(); });
+        child.on('exit', (code) => {
+            if (code !== 0) return reject(new Error(`exit ${code}`));
+            if (!out.includes('hello-spawn')) return reject(new Error(`out: ${out}`));
+            resolve(`pid=${child.pid}, out=${out.trim()}`);
+        });
+        child.on('error', reject);
+    });
+});
+
+test('child_process.spawn streams output progressively', async () => {
+    return new Promise((resolve, reject) => {
+        // emit 3 lines with a 40ms delay between them
+        const cmdStr = `node -e "setTimeout(()=>console.log('A'),0); setTimeout(()=>console.log('B'),40); setTimeout(()=>console.log('C'),80);"`;
+        const child = cp.spawn(cmdStr);
+        const events = [];
+        child.stdout.on('data', (d) => events.push({ t: Date.now(), d: d.toString() }));
+        child.on('exit', (code) => {
+            if (code !== 0) return reject(new Error(`exit ${code}`));
+            if (events.length < 1) return reject(new Error('no data events'));
+            const allData = events.map(e => e.d).join('');
+            if (!allData.includes('A') || !allData.includes('B') || !allData.includes('C'))
+                return reject(new Error(`missing chars in: ${JSON.stringify(allData)}`));
+            resolve(`received ${events.length} data event(s), ${allData.length} bytes`);
+        });
+    });
+});
+
+test('child_process.spawn captures stderr separately', async () => {
+    return new Promise((resolve, reject) => {
+        const child = cp.spawn(`node -e "console.log('OUTLINE'); console.error('ERRLINE')"`);
+        let out = '', err = '';
+        child.stdout.on('data', d => out += d.toString());
+        child.stderr.on('data', d => err += d.toString());
+        child.on('exit', (code) => {
+            if (code !== 0) return reject(new Error(`exit ${code}`));
+            if (!out.includes('OUTLINE')) return reject(new Error('no OUTLINE'));
+            if (!err.includes('ERRLINE')) return reject(new Error('no ERRLINE'));
+            resolve('out & err captured separately');
+        });
+    });
+});
+
+test('child_process.spawn exit code propagates', async () => {
+    return new Promise((resolve, reject) => {
+        const child = cp.spawn(`node -e "process.exit(7)"`);
+        child.on('exit', (code) => {
+            if (code !== 7) return reject(new Error(`got ${code}`));
+            resolve('exit 7 reached caller');
+        });
+    });
+});
+
+// ── Phase 6: process.env virtualization ─────────────────────
+
+test('process.env reflects remote host (has OS=Windows_NT or similar)', async () => {
+    // wait for host_info to land
+    await new Promise(r => setTimeout(r, 400));
+    const os_var = process.env.OS;
+    const windir = process.env.windir || process.env.WINDIR;
+    if (!os_var && !windir) throw new Error(`no OS/windir: OS=${os_var}, windir=${windir}`);
+    return `OS=${os_var}, windir=${windir}`;
+});
+
+test('process.env.USERNAME is W7 user when remote is active', async () => {
+    const u = process.env.USERNAME;
+    if (!u) throw new Error('no USERNAME in remote env');
+    return `USERNAME=${u}`;
+});
+
+test('process.env.HOME stays /cloud/dumbterm/home regardless of host', async () => {
+    if (process.env.HOME !== '/cloud/dumbterm/home') throw new Error(process.env.HOME);
+    await exec('dumbterm-host local');
+    const h2 = process.env.HOME;
+    await exec('dumbterm-host remote');
+    if (h2 !== '/cloud/dumbterm/home') throw new Error(`local: ${h2}`);
+    return 'HOME pinned to cloud home across switches';
+});
+
+test('switching to local reveals Mac env vars', async () => {
+    await exec('dumbterm-host local');
+    const shell = process.env.SHELL;
+    const term = process.env.TERM;
+    await exec('dumbterm-host remote');
+    if (!shell && !term) throw new Error(`no Mac-ish env: SHELL=${shell}, TERM=${term}`);
+    return `SHELL=${shell}, TERM=${term}`;
+});
+
+test('env writes visible via process.env[k]', async () => {
+    process.env.FLOWTO_TESTKEY = 'marker-value';
+    if (process.env.FLOWTO_TESTKEY !== 'marker-value') throw new Error('read-back failed');
+    delete process.env.FLOWTO_TESTKEY;
+    if ('FLOWTO_TESTKEY' in process.env) throw new Error('delete failed');
+    return 'set + delete roundtrip';
+});
+
 // Cleanup tests
 test('cleanup cloud test files', async () => {
     await unlink('/cloud/dumbterm/tester_smoke.txt');

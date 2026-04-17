@@ -66,7 +66,13 @@ function connectGateway(cb) {
             try {
                 const msg = JSON.parse(line);
                 const p = _pending.get(msg.id);
-                if (p) { _pending.delete(msg.id); p(null, msg); }
+                if (p) {
+                    // For single-response ops, handler is the user callback.
+                    // For streaming ops (spawn), handler is rpcStream's wrapper
+                    // which keeps itself registered until it sees an exit msg.
+                    if (p._streaming) p(null, msg);
+                    else { _pending.delete(msg.id); p(null, msg); }
+                }
             } catch (e) { /* ignore */ }
         }
     });
@@ -83,6 +89,24 @@ function rpcCall(req, cb) {
     });
 }
 
+// For streaming ops (spawn): multiple messages per request. Caller passes
+// an onMsg callback that gets invoked for each response until one with
+// "exit" arrives. Cleanup happens automatically.
+function rpcStream(req, onMsg) {
+    connectGateway((err) => {
+        if (err) { onMsg(err, null); return; }
+        req.id = _nextId++;
+        const handler = (err, msg) => {
+            if (err) { _pending.delete(req.id); onMsg(err, null); return; }
+            onMsg(null, msg);
+            if (msg && 'exit' in msg) _pending.delete(req.id);
+        };
+        handler._streaming = true;
+        _pending.set(req.id, handler);
+        _conn.write(JSON.stringify(req) + '\n');
+    });
+}
+
 // ── Fetch host_info lazily and cache on the host entry ───────
 function refreshHostInfo(hostName, cb) {
     const h = hosts[hostName];
@@ -93,6 +117,7 @@ function refreshHostInfo(hostName, cb) {
         if (h.cwd == null) h.cwd = resp.cwd; // preserve any previous chdir
         h.platform = resp.platform;
         h.sep = resp.sep;
+        h.env = Object.assign({}, resp.env || {}); // snapshot
         cb && cb(null);
     });
 }
@@ -117,6 +142,96 @@ function maybeMetaCommand(cmd) {
     }
     return { handled: false };
 }
+
+// ── Wrap child_process.spawn ──────────────────────────────────
+// Returns a ChildProcess-like object with stdout/stderr Readable streams,
+// pid, and exit/close events. stdin is stubbed (not yet supported).
+const origSpawn = child_process.spawn;
+const { Readable, Writable } = require('stream');
+const EventEmitter = require('events');
+
+function makeRemoteChild(cmdString, options) {
+    const useHost = activeHost;
+    const cwd = options.cwd || (hosts[useHost] && hosts[useHost].cwd) || '';
+    const child = new EventEmitter();
+    const stdoutStream = new Readable({ read() {} });
+    const stderrStream = new Readable({ read() {} });
+    const stdinStub = new Writable({ write(chunk, enc, cb) { cb(new Error('flowto: spawn.stdin not yet supported')); } });
+    child.stdout = stdoutStream;
+    child.stderr = stderrStream;
+    child.stdin = stdinStub;
+    child.pid = null;
+    child.killed = false;
+    child.exitCode = null;
+    child.signalCode = null;
+    child.kill = function () { /* not yet supported */ };
+
+    rpcStream({ op: 'spawn', host: useHost, cmd: cmdString, cwd }, (err, msg) => {
+        if (err) {
+            stdoutStream.destroy(err);
+            stderrStream.destroy(err);
+            child.emit('error', err);
+            return;
+        }
+        if (msg.ok && msg.pid) {
+            child.pid = msg.pid;
+            child.emit('spawn');
+            return;
+        }
+        if (msg.stream === 'out' && msg.data) {
+            stdoutStream.push(Buffer.from(msg.data, 'base64'));
+        } else if (msg.stream === 'err' && msg.data) {
+            stderrStream.push(Buffer.from(msg.data, 'base64'));
+        } else if ('exit' in msg) {
+            child.exitCode = msg.exit;
+            stdoutStream.push(null);
+            stderrStream.push(null);
+            child.emit('exit', msg.exit, null);
+            child.emit('close', msg.exit, null);
+        }
+    });
+    return child;
+}
+
+child_process.spawn = function (cmd, args, options) {
+    // Node's spawn signature: spawn(cmd) | spawn(cmd, args) | spawn(cmd, options) | spawn(cmd, args, options)
+    if (Array.isArray(args)) { options = options || {}; }
+    else if (typeof args === 'object' && args !== null) { options = args; args = []; }
+    else { args = []; options = options || {}; }
+
+    const meta = maybeMetaCommand(cmd);
+    if (meta.handled) {
+        // Build a fake child that emits the meta result
+        const child = new EventEmitter();
+        const out = new Readable({ read() {} });
+        const err = new Readable({ read() {} });
+        child.stdout = out; child.stderr = err;
+        child.stdin = new Writable({ write(c,e,cb){cb();} });
+        process.nextTick(() => {
+            if (meta.out) out.push(Buffer.from(meta.out));
+            if (meta.err) err.push(Buffer.from(meta.err));
+            out.push(null); err.push(null);
+            child.emit('exit', meta.exit, null);
+            child.emit('close', meta.exit, null);
+        });
+        return child;
+    }
+
+    const useHost = meta.oneShotHost || activeHost;
+    const useCmd = meta.oneShotCmd || (args.length ? cmd + ' ' + args.join(' ') : cmd);
+
+    if (useHost === 'local') {
+        const savedPlatformDesc = Object.getOwnPropertyDescriptor(process, 'platform');
+        Object.defineProperty(process, 'platform', { value: realPlatform, configurable: true });
+        try {
+            return origSpawn.call(this, cmd, args, options);
+        } finally {
+            if (savedPlatformDesc) Object.defineProperty(process, 'platform', savedPlatformDesc);
+        }
+    }
+
+    return makeRemoteChild(useCmd, options);
+};
 
 // ── Wrap child_process.exec ──────────────────────────────────
 const origExec = child_process.exec;
@@ -416,6 +531,60 @@ Object.defineProperty(process, 'platform', {
         get() { const h = hosts[activeHost]; return (h && h.platform === 'win32') ? win32Delim : posixDelim; },
         configurable: true,
     });
+})();
+
+// ── process.env virtualization (Phase 6) ─────────────────────
+// Reads dispatch to active host's env. Writes mutate the active host's env
+// cache AND local Node's real env (so we don't silently lose values).
+// HOME stays overridden to /cloud/dumbterm/home regardless of host.
+hosts.local.env = Object.assign({}, process.env);
+const realEnv = process.env; // original — we keep writing here for child spawn
+function envForHost() {
+    const h = hosts[activeHost];
+    return (h && h.env) || realEnv;
+}
+(function patchEnv() {
+    const envProxy = new Proxy({}, {
+        get(_, key) {
+            if (key === 'HOME') return CLOUD_HOME;
+            const e = envForHost();
+            if (key in e) return e[key];
+            return realEnv[key];
+        },
+        set(_, key, val) {
+            const h = hosts[activeHost];
+            if (h && h.env) h.env[key] = String(val);
+            realEnv[key] = String(val);
+            return true;
+        },
+        deleteProperty(_, key) {
+            const h = hosts[activeHost];
+            if (h && h.env) delete h.env[key];
+            delete realEnv[key];
+            return true;
+        },
+        has(_, key) {
+            const e = envForHost();
+            return key in e || key in realEnv;
+        },
+        ownKeys() {
+            const e = envForHost();
+            const set = new Set([...Object.keys(e), ...Object.keys(realEnv)]);
+            return [...set];
+        },
+        getOwnPropertyDescriptor(_, key) {
+            const val = (key === 'HOME') ? CLOUD_HOME
+                : (key in envForHost() ? envForHost()[key] : realEnv[key]);
+            if (val === undefined) return undefined;
+            return { value: val, writable: true, enumerable: true, configurable: true };
+        },
+    });
+    try {
+        Object.defineProperty(process, 'env', { value: envProxy, writable: true, configurable: true });
+    } catch (e) {
+        // defineProperty may fail on some Node versions — fall back to merging
+        try { Object.assign(process.env, envProxy); } catch (e2) {}
+    }
 })();
 
 // ── Kick off async host_info fetch for the default remote ────
