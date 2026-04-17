@@ -131,10 +131,185 @@ child_process.exec = function (command, options, callback) {
     });
 };
 
+// ── /cloud/... persistent-home path scheme ───────────────────
+// Any path under /cloud/ routes to the persistent host regardless of
+// active host. Default persistent host = defaultRemote (the --flowto target).
+const PERSISTENT_HOST = process.env.DUMBTERM_PERSISTENT_HOST || defaultRemote;
+const CLOUD_PREFIX = '/cloud/dumbterm/';
+const CLOUD_HOME = '/cloud/dumbterm/home';
+const CLOUD_BACKING = process.env.DUMBTERM_CLOUD_BACKING || 'C:\\workspace\\dumbterm-cloud';
+
+function isCloudPath(p) {
+    return typeof p === 'string' && p.startsWith('/cloud/');
+}
+// Map /cloud/dumbterm/home/foo → CLOUD_BACKING + /foo (platform-translated)
+function translateCloudPath(p) {
+    if (!p.startsWith(CLOUD_PREFIX)) return p;
+    const rel = p.slice(CLOUD_PREFIX.length);   // "home/foo"
+    // naive join — agent will open it as-is
+    return CLOUD_BACKING + (CLOUD_BACKING.includes('\\') ? '\\' : '/') + rel.replace(/\//g, CLOUD_BACKING.includes('\\') ? '\\' : '/');
+}
+
+// Which host should a path go to?
+function routeForPath(p) {
+    if (isCloudPath(p)) return PERSISTENT_HOST;
+    return activeHost;
+}
+
+// ── Override HOME / os.homedir ───────────────────────────────
+process.env.HOME = CLOUD_HOME;
+const os = require('os');
+const origHomedir = os.homedir;
+os.homedir = () => CLOUD_HOME;
+os.userInfo = (function(orig) {
+    return function(opts) {
+        const r = orig.call(this, opts);
+        r.homedir = CLOUD_HOME;
+        return r;
+    };
+})(os.userInfo);
+
+// ── Intercept fs.* ───────────────────────────────────────────
+const fs = require('fs');
+
+function rpcToHost(host, req, cb) {
+    if (host === 'local') return null; // caller must handle
+    req.host = host;
+    rpcCall(req, cb);
+    return true;
+}
+
+// fs.readFile(path, [opts], cb)
+const origReadFile = fs.readFile;
+fs.readFile = function (path, opts, cb) {
+    if (typeof opts === 'function') { cb = opts; opts = undefined; }
+    const host = routeForPath(path);
+    if (host === 'local') {
+        return origReadFile.call(this, path, opts, cb);
+    }
+    const remotePath = isCloudPath(path) ? translateCloudPath(path) : path;
+    rpcCall({ op: 'read', host, path: remotePath }, (err, resp) => {
+        if (err) return cb && cb(err);
+        if (!resp.ok) {
+            const e = new Error(resp.err || resp.errno || 'ENOENT');
+            e.code = resp.errno || 'ENOENT'; e.path = path;
+            return cb && cb(e);
+        }
+        const buf = Buffer.from(resp.data || '', 'base64');
+        if (opts && (opts === 'utf8' || opts.encoding === 'utf8')) return cb && cb(null, buf.toString('utf8'));
+        cb && cb(null, buf);
+    });
+};
+
+// fs.writeFile(path, data, [opts], cb)
+const origWriteFile = fs.writeFile;
+fs.writeFile = function (path, data, opts, cb) {
+    if (typeof opts === 'function') { cb = opts; opts = undefined; }
+    const host = routeForPath(path);
+    if (host === 'local') {
+        return origWriteFile.call(this, path, data, opts, cb);
+    }
+    const remotePath = isCloudPath(path) ? translateCloudPath(path) : path;
+    const buf = Buffer.isBuffer(data) ? data : Buffer.from(String(data), (opts && opts.encoding) || 'utf8');
+    rpcCall({ op: 'write', host, path: remotePath, data: buf.toString('base64') }, (err, resp) => {
+        if (err) return cb && cb(err);
+        if (!resp.ok) {
+            const e = new Error(resp.err || resp.errno || 'EIO');
+            e.code = resp.errno || 'EIO'; e.path = path;
+            return cb && cb(e);
+        }
+        cb && cb(null);
+    });
+};
+
+// fs.readdir(path, [opts], cb)
+const origReaddir = fs.readdir;
+fs.readdir = function (path, opts, cb) {
+    if (typeof opts === 'function') { cb = opts; opts = undefined; }
+    const host = routeForPath(path);
+    if (host === 'local') return origReaddir.call(this, path, opts, cb);
+    const remotePath = isCloudPath(path) ? translateCloudPath(path) : path;
+    rpcCall({ op: 'readdir', host, path: remotePath }, (err, resp) => {
+        if (err) return cb && cb(err);
+        if (!resp.ok) {
+            const e = new Error(resp.err || 'ENOENT'); e.code = resp.errno || 'ENOENT'; e.path = path;
+            return cb && cb(e);
+        }
+        cb && cb(null, resp.entries || []);
+    });
+};
+
+// fs.stat(path, cb)
+const origStat = fs.stat;
+fs.stat = function (path, opts, cb) {
+    if (typeof opts === 'function') { cb = opts; opts = undefined; }
+    const host = routeForPath(path);
+    if (host === 'local') return origStat.call(this, path, opts, cb);
+    const remotePath = isCloudPath(path) ? translateCloudPath(path) : path;
+    rpcCall({ op: 'stat', host, path: remotePath }, (err, resp) => {
+        if (err) return cb && cb(err);
+        if (!resp.ok) {
+            const e = new Error('ENOENT'); e.code = 'ENOENT'; e.path = path;
+            return cb && cb(e);
+        }
+        // Mimic Node's fs.Stats shape minimally
+        cb && cb(null, {
+            size: resp.size, mtime: new Date(resp.mtime * 1000), mtimeMs: resp.mtime * 1000,
+            isDirectory: () => !!resp.isDir, isFile: () => !resp.isDir,
+            mode: resp.mode || 0,
+        });
+    });
+};
+
+// fs.unlink(path, cb)
+const origUnlink = fs.unlink;
+fs.unlink = function (path, cb) {
+    const host = routeForPath(path);
+    if (host === 'local') return origUnlink.call(this, path, cb);
+    const remotePath = isCloudPath(path) ? translateCloudPath(path) : path;
+    rpcCall({ op: 'unlink', host, path: remotePath }, (err, resp) => {
+        if (err) return cb && cb(err);
+        if (!resp.ok) { const e = new Error(resp.errno || 'EIO'); e.code = resp.errno || 'EIO'; return cb && cb(e); }
+        cb && cb(null);
+    });
+};
+
+// fs.mkdir
+const origMkdir = fs.mkdir;
+fs.mkdir = function (path, opts, cb) {
+    if (typeof opts === 'function') { cb = opts; opts = undefined; }
+    const host = routeForPath(path);
+    if (host === 'local') return origMkdir.call(this, path, opts, cb);
+    const remotePath = isCloudPath(path) ? translateCloudPath(path) : path;
+    rpcCall({ op: 'mkdir', host, path: remotePath }, (err, resp) => {
+        if (err) return cb && cb(err);
+        if (!resp.ok) { const e = new Error(resp.errno || 'EIO'); e.code = resp.errno || 'EIO'; return cb && cb(e); }
+        cb && cb(null);
+    });
+};
+
+// fs.promises: rebuild from patched callback versions
+fs.promises.readFile = (path, opts) => new Promise((res, rej) =>
+    fs.readFile(path, opts, (err, data) => err ? rej(err) : res(data)));
+fs.promises.writeFile = (path, data, opts) => new Promise((res, rej) =>
+    fs.writeFile(path, data, opts, (err) => err ? rej(err) : res()));
+fs.promises.readdir = (path, opts) => new Promise((res, rej) =>
+    fs.readdir(path, opts, (err, entries) => err ? rej(err) : res(entries)));
+fs.promises.stat = (path) => new Promise((res, rej) =>
+    fs.stat(path, (err, s) => err ? rej(err) : res(s)));
+fs.promises.unlink = (path) => new Promise((res, rej) =>
+    fs.unlink(path, (err) => err ? rej(err) : res()));
+fs.promises.mkdir = (path, opts) => new Promise((res, rej) =>
+    fs.mkdir(path, opts, (err) => err ? rej(err) : res()));
+
 // ── Expose shim state for tests ──────────────────────────────
 global.__flowto = {
     get activeHost() { return activeHost; },
     set activeHost(v) { activeHost = v; },
     hosts,
     rpcCall,
+    CLOUD_HOME,
+    isCloudPath,
+    routeForPath,
+    translateCloudPath,
 };

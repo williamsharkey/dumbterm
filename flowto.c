@@ -19,6 +19,16 @@
 #ifndef FLOWTO_C
 #define FLOWTO_C
 
+#include <sys/stat.h>
+#include <dirent.h>
+#ifndef _WIN32
+#include <sys/types.h>
+#endif
+/* S_ISDIR missing on some MinGW headers */
+#ifndef S_ISDIR
+#define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
+#endif
+
 /* ── minimal JSON parse + base64 ─────────────────────────────── */
 
 /* base64 encode (caller frees) */
@@ -37,6 +47,39 @@ static char *b64_encode(const unsigned char *data, int len) {
         out[j++] = (i + 2 < len) ? T[v & 0x3F] : '=';
     }
     out[j] = 0;
+    return out;
+}
+
+/* base64 decode (caller frees). *out_len gets output size. Returns NULL on error. */
+static unsigned char *b64_decode(const char *s, int *out_len) {
+    static const unsigned char DT[256] = {
+        /* initialize with 0xFF then set valid chars inline at runtime — but for
+           simplicity: compute on demand */
+        0
+    };
+    static int inited = 0;
+    static unsigned char DT2[256];
+    if (!inited) {
+        int i; for (i = 0; i < 256; i++) DT2[i] = 0xFF;
+        const char *T = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        for (i = 0; T[i]; i++) DT2[(unsigned char)T[i]] = i;
+        inited = 1;
+    }
+    int slen = strlen(s);
+    /* strip trailing '=' */
+    while (slen > 0 && s[slen-1] == '=') slen--;
+    int olen = (slen * 3) / 4;
+    unsigned char *out = (unsigned char*)malloc(olen + 4);
+    int oi = 0, i;
+    unsigned int v = 0; int bits = 0;
+    for (i = 0; i < slen; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (DT2[c] == 0xFF) { if (c == '\r' || c == '\n' || c == ' ') continue; free(out); return NULL; }
+        v = (v << 6) | DT2[c];
+        bits += 6;
+        if (bits >= 8) { bits -= 8; out[oi++] = (v >> bits) & 0xFF; }
+    }
+    *out_len = oi;
     return out;
 }
 
@@ -269,6 +312,114 @@ static void agent_handle_request(sock_t s, const char *req) {
         rpc_write_line(s, msg);
         free(msg); free(out_b64); free(err_b64);
         free(cmd); free(cwd); free(out); free(err);
+    } else if (strcmp(op, "read") == 0) {
+        char *path = json_str(req, "path");
+        FILE *f = path ? fopen(path, "rb") : NULL;
+        if (!f) {
+            char msg[512];
+            snprintf(msg, sizeof(msg), "{\"id\":%d,\"ok\":false,\"errno\":\"%s\",\"err\":\"%s\"}",
+                     id, (errno == ENOENT ? "ENOENT" : errno == EACCES ? "EACCES" : "EIO"), strerror(errno));
+            rpc_write_line(s, msg);
+        } else {
+            fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+            unsigned char *buf = (unsigned char*)malloc(sz > 0 ? sz : 1);
+            int n = sz > 0 ? (int)fread(buf, 1, sz, f) : 0;
+            fclose(f);
+            char *b64 = b64_encode(buf, n);
+            int cap = strlen(b64) + 128; char *msg = (char*)malloc(cap);
+            snprintf(msg, cap, "{\"id\":%d,\"ok\":true,\"data\":\"%s\"}", id, b64);
+            rpc_write_line(s, msg);
+            free(msg); free(b64); free(buf);
+        }
+        free(path);
+    } else if (strcmp(op, "write") == 0) {
+        char *path = json_str(req, "path");
+        char *data = json_str(req, "data");
+        int data_len = 0;
+        unsigned char *bytes = data ? b64_decode(data, &data_len) : NULL;
+        int ok_w = 0;
+        if (path && bytes) {
+            FILE *f = fopen(path, "wb");
+            if (f) {
+                if (fwrite(bytes, 1, data_len, f) == (size_t)data_len) ok_w = 1;
+                fclose(f);
+            }
+        }
+        char msg[512];
+        if (ok_w) snprintf(msg, sizeof(msg), "{\"id\":%d,\"ok\":true}", id);
+        else      snprintf(msg, sizeof(msg), "{\"id\":%d,\"ok\":false,\"errno\":\"%s\",\"err\":\"%s\"}",
+                           id, (errno == ENOENT ? "ENOENT" : errno == EACCES ? "EACCES" : "EIO"),
+                           strerror(errno));
+        rpc_write_line(s, msg);
+        free(path); free(data); free(bytes);
+    } else if (strcmp(op, "stat") == 0) {
+        char *path = json_str(req, "path");
+        struct stat st;
+        if (path && stat(path, &st) == 0) {
+            int is_dir = S_ISDIR(st.st_mode) ? 1 : 0;
+            char msg[512];
+            snprintf(msg, sizeof(msg),
+                "{\"id\":%d,\"ok\":true,\"size\":%lld,\"mtime\":%lld,\"isDir\":%s,\"mode\":%u}",
+                id, (long long)st.st_size, (long long)st.st_mtime,
+                is_dir ? "true" : "false", (unsigned)st.st_mode);
+            rpc_write_line(s, msg);
+        } else {
+            char msg[256];
+            snprintf(msg, sizeof(msg), "{\"id\":%d,\"ok\":false,\"errno\":\"ENOENT\"}", id);
+            rpc_write_line(s, msg);
+        }
+        free(path);
+    } else if (strcmp(op, "readdir") == 0) {
+        char *path = json_str(req, "path");
+        /* portable: use opendir/readdir — works on POSIX + MinGW */
+        DIR *d = path ? opendir(path) : NULL;
+        if (!d) {
+            char msg[256];
+            snprintf(msg, sizeof(msg), "{\"id\":%d,\"ok\":false,\"errno\":\"ENOENT\"}", id);
+            rpc_write_line(s, msg);
+        } else {
+            /* build JSON array of names */
+            int cap = 4096; char *out = (char*)malloc(cap); int pos = 0;
+            pos += snprintf(out + pos, cap - pos, "{\"id\":%d,\"ok\":true,\"entries\":[", id);
+            struct dirent *ent; int first = 1;
+            while ((ent = readdir(d))) {
+                if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
+                /* JSON-escape the name */
+                char esc[1024]; json_escape(esc, ent->d_name);
+                /* grow buffer if needed */
+                int need = strlen(esc) + 8;
+                if (pos + need > cap) { cap = (pos + need) * 2; out = (char*)realloc(out, cap); }
+                pos += snprintf(out + pos, cap - pos, "%s\"%s\"", first ? "" : ",", esc);
+                first = 0;
+            }
+            closedir(d);
+            pos += snprintf(out + pos, cap - pos, "]}");
+            rpc_write_line(s, out);
+            free(out);
+        }
+        free(path);
+    } else if (strcmp(op, "unlink") == 0) {
+        char *path = json_str(req, "path");
+        int rc = path ? unlink(path) : -1;
+        char msg[256];
+        if (rc == 0) snprintf(msg, sizeof(msg), "{\"id\":%d,\"ok\":true}", id);
+        else snprintf(msg, sizeof(msg), "{\"id\":%d,\"ok\":false,\"errno\":\"%s\"}",
+                      id, (errno == ENOENT ? "ENOENT" : "EIO"));
+        rpc_write_line(s, msg);
+        free(path);
+    } else if (strcmp(op, "mkdir") == 0) {
+        char *path = json_str(req, "path");
+#ifdef _WIN32
+        int rc = path ? mkdir(path) : -1;
+#else
+        int rc = path ? mkdir(path, 0755) : -1;
+#endif
+        char msg[256];
+        if (rc == 0) snprintf(msg, sizeof(msg), "{\"id\":%d,\"ok\":true}", id);
+        else snprintf(msg, sizeof(msg), "{\"id\":%d,\"ok\":false,\"errno\":\"%s\"}",
+                      id, strerror(errno));
+        rpc_write_line(s, msg);
+        free(path);
     } else {
         char msg[256];
         snprintf(msg, sizeof(msg), "{\"id\":%d,\"ok\":false,\"err\":\"unknown op: %s\"}", id, op);

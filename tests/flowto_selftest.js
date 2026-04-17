@@ -3,6 +3,8 @@
 //   dumbterm --flowto HOST:PORT -- node tests/flowto_selftest.js
 
 const cp = require('child_process');
+const fs = require('fs');
+const os = require('os');
 
 let pass = 0, fail = 0;
 function ok(name, cond, detail) {
@@ -82,6 +84,66 @@ async function main() {
     r = await execP(`${NODE_EXEC} "console.log(process.env.OS || process.env.SHELL || 'none')"`);
     ok('remote env accessible', r.out.trim().length > 0,
         `got: ${JSON.stringify(r.out)}`);
+
+    // ── Phase 2: fs.* ────────────────────────────────────────────
+
+    // 11. homedir override
+    ok('os.homedir is cloud', os.homedir() === '/cloud/dumbterm/home',
+        `got: ${os.homedir()}`);
+    ok('process.env.HOME is cloud', process.env.HOME === '/cloud/dumbterm/home',
+        `got: ${process.env.HOME}`);
+
+    // 12. fs round-trip on /cloud/
+    const cloudFile = '/cloud/dumbterm/selftest_phase2.txt';
+    try { await fs.promises.mkdir('/cloud/dumbterm/'); } catch(e) { /* may exist */ }
+    await fs.promises.writeFile(cloudFile, 'hello from phase 2');
+    const read = await fs.promises.readFile(cloudFile, 'utf8');
+    ok('cloud write+read round-trip', read === 'hello from phase 2',
+        `got: ${JSON.stringify(read)}`);
+
+    // 13. Cloud file persists across host switch
+    await execP('dumbterm-host local');
+    // On local, /cloud/ still routes to persistent host
+    const read2 = await fs.promises.readFile(cloudFile, 'utf8');
+    ok('cloud path reads same after switching to local', read2 === 'hello from phase 2',
+        `got: ${JSON.stringify(read2)}`);
+    await execP('dumbterm-host remote');
+
+    // 14. readdir on cloud dir
+    const entries = await fs.promises.readdir('/cloud/dumbterm/');
+    ok('readdir returns cloud entries', entries.some(e => e.includes('selftest_phase2.txt')),
+        `got: ${JSON.stringify(entries)}`);
+
+    // 15. stat returns size
+    const st = await fs.promises.stat(cloudFile);
+    ok('stat returns correct size', st.size === 18, `expected 18, got: ${st.size}`);
+    ok('stat isFile=true', st.isFile());
+    ok('stat isDirectory=false', !st.isDirectory());
+
+    // 16. Binary round-trip (bytes 0..255)
+    const binPath = '/cloud/dumbterm/bin_test.dat';
+    const bytes = Buffer.alloc(256);
+    for (let i = 0; i < 256; i++) bytes[i] = i;
+    await fs.promises.writeFile(binPath, bytes);
+    const binBack = await fs.promises.readFile(binPath);
+    let binOk = binBack.length === 256;
+    for (let i = 0; i < 256 && binOk; i++) if (binBack[i] !== i) binOk = false;
+    ok('binary 256-byte round-trip', binOk, `len: ${binBack.length}`);
+
+    // 17. unlink
+    await fs.promises.unlink(binPath);
+    let existed = true;
+    try { await fs.promises.stat(binPath); } catch (e) { if (e.code === 'ENOENT') existed = false; }
+    ok('unlink removes file', !existed);
+
+    // 18. ENOENT on missing file
+    let errCode = null;
+    try { await fs.promises.readFile('/cloud/dumbterm/nonexistent.xyz'); }
+    catch (e) { errCode = e.code; }
+    ok('ENOENT on missing cloud file', errCode === 'ENOENT', `code: ${errCode}`);
+
+    // Cleanup
+    try { await fs.promises.unlink(cloudFile); } catch(e) {}
 
     console.log(`\n1..${pass+fail}`);
     console.log(`# pass ${pass}, fail ${fail}`);
