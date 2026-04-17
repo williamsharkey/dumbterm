@@ -117,13 +117,97 @@ The relay bridges a local TCP port through `ssh -W` to the W7 server. Requires S
 
 ```
 dumbterm.c       — The terminal (everything in one file)
+flowto.c         — Remote execution agent + driver (included from dumbterm.c)
+flowto_shim.js   — Node --require shim for child_process/fs interception
 unifont_data.h   — Pre-generated GNU Unifont glyph data (609 glyphs)
 hook.c           — W7 DLL injection experiment (abandoned, shim approach won)
 relay.py         — SSH relay for remote connections through firewalls
 web/             — WebGL browser terminal variant + Go WebSocket bridge
-tools/           — Font extraction and test utilities
-tests/           — Automated end-to-end tests (Mac local, Mac remote, W7 remote)
+tools/           — Font extraction, deployment scripts, config template
+  deploy-w7.sh   — Deploy/refresh the flowto agent on W7 (one command)
+  flowto.example.json — Template .flowto.json to drop in your project
+tests/           — Automated end-to-end tests (57/57 on real W7)
+  flowto_tester.js — Visual+headless tester (TUI + TAP output + JSON trace)
+  run_full.sh    — Canonical invocation for the full suite
 ```
+
+## flowto: run apps locally, route tool calls remotely
+
+`flowto` is a transparent Node.js proxy that makes it feel like a program (like Claude Code) is running on machine A while its `child_process.exec/spawn` and `fs.*` calls actually execute on machine B.
+
+The driving use case: run Claude Code on a fast Mac (for the LLM compute and large context window), but have all Bash / file ops land on a Windows 7 box with legacy tooling (Lotus R5, MinGW, W7-only binaries).
+
+**Two commands:**
+
+```bash
+# On W7 (the tool target):
+dumbterm --agent 9187 --on-start 'SUBST M: C:\mdrive'
+
+# On Mac (where Claude Code runs):
+dumbterm --flowto HOST:9187 -- claude
+```
+
+The Mac spawns Claude Code locally. A JS shim (`flowto_shim.js`) injected via `--require` intercepts `child_process.exec/spawn` and `fs.*` — these calls marshal to the W7 agent over TCP (JSON-line protocol, base64 for binary payloads).
+
+**Key capabilities:**
+
+- **Custom shell**: configure `remoteShell` in `.flowto.json` (e.g., MSYS bash for POSIX commands on W7)
+- **Path translation**: `pathMap: [["/Users/.../lot", "/c/workspace/lot"]]` — Claude's Mac paths auto-translate to W7 paths
+- **Host switching at runtime**: `dumbterm-host local` / `dumbterm-host remote` / `dumbterm-at w7 <cmd>` — Claude can flip between hosts mid-session
+- **Persistent `/cloud/`**: paths under `/cloud/dumbterm/` always persist on one designated host
+- **`--on-start` hooks**: agent runs shell commands at startup (e.g., `SUBST` drive mappings that don't survive W7 reboots)
+- **Auto-injected context**: `/tmp/flowto-context.md` describes the current session for Claude Code to pick up (with clear BEGIN/END markers so user edits survive)
+
+See [`tools/flowto.example.json`](tools/flowto.example.json) for a template.
+
+## Setting up flowto on Windows 7
+
+One-time setup:
+
+```bash
+# 1. Clone the repo on W7 (via git-bash or from SSH):
+ssh w7 "cd /c/workspace && git clone https://github.com/williamsharkey/dumbterm.git"
+
+# 2. Build the agent:
+ssh w7 '"C:\Program Files\Git\bin\bash.exe" -c "cd /c/workspace/dumbterm && C:/MinGW/bin/gcc.exe -O2 -o dumbterm_agent.exe dumbterm.c -lopengl32 -lgdi32 -luser32 -lkernel32 -lws2_32 -lm"'
+
+# 3. Create a launcher .bat on W7 (edit on W7 directly, e.g. via Notepad):
+#    C:\workspace\dumbterm\run-agent.bat :
+#      @echo off
+#      C:\workspace\dumbterm\dumbterm_agent.exe --agent 9187 --on-start "SUBST M: C:\mdrive"
+#
+#    (--on-start remaps M: on every agent start — W7 loses SUBST across reboots.)
+
+# 4. Register a scheduled task (runs the .bat in interactive session 1):
+ssh w7 "schtasks /Create /TN dumbterm-agent /TR C:\workspace\dumbterm\run-agent.bat /SC ONCE /ST 00:00 /F"
+
+# 5. Start it:
+ssh w7 "schtasks /Run /TN dumbterm-agent"
+```
+
+Ongoing deploys — one command from Mac:
+
+```bash
+./tools/deploy-w7.sh   # stop → pull → rebuild → relaunch
+```
+
+**SSH `-L` does not work** to W7 (sshd has `AllowTcpForwarding no` in a Match block somewhere). Use the provided relay:
+
+```bash
+# On Mac:
+python3 relay.py 9187 9187    # forwards via ssh -W instead of -L
+```
+
+Drop a `.flowto.json` in your project root. Copy from `tools/flowto.example.json` and edit the `pathMap` prefix to your username.
+
+Run your app:
+
+```bash
+cd ~/Desktop/lot
+./dumbterm --flowto 127.0.0.1:9187 -- claude
+```
+
+Now Claude's `Bash` runs in W7's MSYS bash in `/c/workspace/lot`; `Read` of `~/Desktop/lot/main.c` auto-resolves to W7's `/c/workspace/lot/main.c`; its memory and auth stay on Mac.
 
 ## For other Windows 7 / legacy Windows users
 

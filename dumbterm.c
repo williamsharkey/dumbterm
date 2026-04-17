@@ -53,9 +53,14 @@ static int g_net_mode = 0; /* 0=local, 1=listen(server), 2=connect(client) */
 static int g_server_visible = 0; /* --visible: show local window while serving */
 
 /* --flowto: spawn child here, route tool calls (via JS shim RPC) to remote agent.
-   --agent: act as agent — listen for RPC requests, execute locally. */
+   --agent: act as agent — listen for RPC requests, execute locally.
+   --on-start: shell command executed once before agent starts listening
+               (useful for W7 drive mappings like `SUBST M: C:\mdrive`). */
 static char *g_flowto_addr = NULL;  /* --flowto HOST:PORT */
 static char *g_agent_addr  = NULL;  /* --agent PORT */
+#define MAX_ON_START 16
+static char *g_on_start_cmds[MAX_ON_START]; /* --on-start CMD (may repeat) */
+static int   g_on_start_count = 0;
 static int   g_flowto_selftest = 0; /* --selftest: run flowto self-test */
 
 /* multi-client support for server mode */
@@ -1728,6 +1733,9 @@ int main(int argc, char **argv) {
             g_flowto_addr = argv[++i];
         } else if (strcmp(argv[i], "--agent") == 0 && i+1 < argc) {
             g_agent_addr = argv[++i];
+        } else if (strcmp(argv[i], "--on-start") == 0 && i+1 < argc) {
+            if (g_on_start_count < MAX_ON_START) g_on_start_cmds[g_on_start_count++] = argv[++i];
+            else ++i;
         } else if (strcmp(argv[i], "--selftest") == 0) {
             g_flowto_selftest = 1;
         } else if (strcmp(argv[i], "--") == 0) { i++; break; }
@@ -3194,6 +3202,9 @@ int main(int argc, char **argv) {
             g_flowto_addr = argv[++i];
         } else if (strcmp(argv[i], "--agent") == 0 && i+1 < argc) {
             g_agent_addr = argv[++i];
+        } else if (strcmp(argv[i], "--on-start") == 0 && i+1 < argc) {
+            if (g_on_start_count < MAX_ON_START) g_on_start_cmds[g_on_start_count++] = argv[++i];
+            else ++i;
         } else if (strcmp(argv[i], "--selftest") == 0) {
             g_flowto_selftest = 1;
         } else if (strcmp(argv[i], "--") == 0) { i++; break; }

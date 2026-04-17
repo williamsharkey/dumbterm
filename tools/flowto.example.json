@@ -1,0 +1,29 @@
+{
+  "// -- comment out or remove fields you don't need --": "",
+
+  "defaultHost": "remote",
+
+  "// remoteCwd: which directory on the agent to treat as cwd": "",
+  "remoteCwd": "/c/workspace/lot",
+
+  "// remoteShell: shell the agent uses to run exec/spawn commands": "",
+  "// for W7 with MinGW bash installed: '/usr/bin/bash'": "",
+  "// for git-bash: '/c/Program Files/Git/usr/bin/bash.exe'": "",
+  "remoteShell": "/usr/bin/bash",
+
+  "// pathMap: [[localPrefix, remotePrefix], ...]": "",
+  "// any fs/exec path with localPrefix is rewritten to remotePrefix before RPC": "",
+  "pathMap": [
+    ["/Users/YOUR_USERNAME/Desktop/lot", "/c/workspace/lot"]
+  ],
+
+  "// virtualFs=true → all non-local fs calls route to active host": "",
+  "// virtualCwd=true → per-host cwd tracking": "",
+  "// keep virtualPlatform/virtualPath/virtualEnv OFF unless you want full": "",
+  "//   Windows simulation (Claude Code doesn't like it)": "",
+  "virtualFs": true,
+  "virtualCwd": true,
+
+  "// skipContext=true → don't write FLOWTO_CONTEXT.md": "",
+  "skipContext": false
+}

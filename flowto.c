@@ -799,6 +799,13 @@ static void agent_handle_request(sock_t s, const char *req) {
 /* Run as --agent: listen, accept one client, serve RPC forever. */
 static int flowto_run_agent(const char *addr) {
     sock_init();
+    /* Run any --on-start commands before binding. Best-effort — log failures. */
+    for (int i = 0; i < g_on_start_count; i++) {
+        const char *c = g_on_start_cmds[i];
+        fprintf(stderr, "flowto agent: on-start: %s\n", c);
+        int rc = system(c);
+        if (rc != 0) fprintf(stderr, "flowto agent: on-start rc=%d (continuing)\n", rc);
+    }
     int port = atoi(addr);
     char host[64] = "0.0.0.0";
     const char *colon = strchr(addr, ':');
