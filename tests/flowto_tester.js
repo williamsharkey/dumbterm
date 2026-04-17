@@ -69,6 +69,7 @@ let currentStatus = '';
 let currentDetail = '';
 
 function draw() {
+    if (HEADLESS) return; // no ANSI, no full redraw
     let out = AN.clear;
     out += AN.bold + AN.fg.amber + 'flowto tester' + AN.reset + AN.dim + '  —  dumbterm Phase 1+2 integration test\n' + AN.reset;
     out += AN.dim + '─'.repeat(W) + AN.reset + '\n';
@@ -450,6 +451,77 @@ test('cwd is per-host: switching restores each host\'s cwd', async () => {
     return `remote ${remoteCwd}, local ${localCwd}, remote restored correctly`;
 });
 
+// ── Phase 4: path module active-host dispatch ───────────────
+
+test('path.sep is backslash when remote is win32', async () => {
+    const path = require('path');
+    // ensure host_info arrived
+    await new Promise(r => setTimeout(r, 200));
+    if (path.sep !== '\\') throw new Error(`sep = ${JSON.stringify(path.sep)}`);
+    return 'path.sep = "\\"';
+});
+
+test('path.join uses backslash on remote win32', async () => {
+    const path = require('path');
+    const j = path.join('a', 'b', 'c');
+    if (j !== 'a\\b\\c') throw new Error(`got: ${j}`);
+    return `join = ${j}`;
+});
+
+test('path.resolve returns W7-style absolute path', async () => {
+    const path = require('path');
+    // resolve with an absolute Windows path — should be preserved
+    const r = path.resolve('C:\\workspace', 'sub', 'file.txt');
+    if (r !== 'C:\\workspace\\sub\\file.txt') throw new Error(`got: ${r}`);
+    return r;
+});
+
+test('path.isAbsolute recognizes Windows absolute path', async () => {
+    const path = require('path');
+    if (!path.isAbsolute('C:\\workspace')) throw new Error('missed C:\\workspace');
+    if (path.isAbsolute('relative\\path')) throw new Error('false positive');
+    return 'C:\\ yes, relative no';
+});
+
+test('path.dirname / basename with backslash input', async () => {
+    const path = require('path');
+    if (path.dirname('C:\\workspace\\file.txt') !== 'C:\\workspace') throw new Error('dirname wrong');
+    if (path.basename('C:\\workspace\\file.txt') !== 'file.txt') throw new Error('basename wrong');
+    return 'dirname=C:\\workspace, basename=file.txt';
+});
+
+test('path.normalize collapses .. on win32', async () => {
+    const path = require('path');
+    const n = path.normalize('C:\\a\\b\\..\\c');
+    if (n !== 'C:\\a\\c') throw new Error(`got: ${n}`);
+    return n;
+});
+
+test('switching to local makes path posix-style', async () => {
+    const path = require('path');
+    await exec('dumbterm-host local');
+    const sep = path.sep;
+    const j = path.join('a', 'b', 'c');
+    const d = path.dirname('/tmp/file.txt');
+    await exec('dumbterm-host remote');
+    if (sep !== '/') throw new Error(`local sep: ${sep}`);
+    if (j !== 'a/b/c') throw new Error(`local join: ${j}`);
+    if (d !== '/tmp') throw new Error(`local dirname: ${d}`);
+    return 'local: sep=/, join=a/b/c, dirname=/tmp';
+});
+
+test('path.sep updates dynamically on host switch', async () => {
+    const path = require('path');
+    const remoteSep = path.sep;
+    await exec('dumbterm-host local');
+    const localSep = path.sep;
+    await exec('dumbterm-host remote');
+    const remoteSep2 = path.sep;
+    if (remoteSep !== '\\' || localSep !== '/' || remoteSep2 !== '\\')
+        throw new Error(`got: ${remoteSep}, ${localSep}, ${remoteSep2}`);
+    return 'sep tracks active host dynamically';
+});
+
 // Cleanup tests
 test('cleanup cloud test files', async () => {
     await unlink('/cloud/dumbterm/tester_smoke.txt');
@@ -459,6 +531,7 @@ test('cleanup cloud test files', async () => {
 
 // ── Runner ───────────────────────────────────────────────────
 const INTERACTIVE = process.argv.includes('--interactive');
+const HEADLESS = process.argv.includes('--headless');
 
 async function waitKey() {
     return new Promise((res) => {
@@ -473,9 +546,10 @@ async function waitKey() {
 }
 
 async function main() {
-    process.stdout.write(AN.hideCur);
-    trace('run_start', { count: tests.length, interactive: INTERACTIVE });
+    if (!HEADLESS) process.stdout.write(AN.hideCur);
+    trace('run_start', { count: tests.length, interactive: INTERACTIVE, headless: HEADLESS });
     draw();
+    if (HEADLESS) process.stdout.write(`# flowto tester — ${tests.length} tests, headless mode\n`);
 
     for (let i = 0; i < tests.length; i++) {
         const t = tests[i];
@@ -489,10 +563,12 @@ async function main() {
             t.status = 'pass';
             t.detail = result || '';
             trace('test_pass', { i, name: t.name, result });
+            if (HEADLESS) process.stdout.write(`ok ${i+1} ${t.name}` + (result ? ` — ${result}` : '') + '\n');
         } catch (e) {
             t.status = 'fail';
             t.detail = e.message || String(e);
             trace('test_fail', { i, name: t.name, error: e.message, stack: e.stack });
+            if (HEADLESS) process.stdout.write(`not ok ${i+1} ${t.name}\n  # ${e.message}\n`);
         }
         currentStatus = '';
         currentDetail = '';
@@ -504,9 +580,13 @@ async function main() {
     }
 
     const failed = tests.filter(t => t.status === 'fail').length;
-    trace('run_done', { pass: tests.length - failed, fail: failed });
-    process.stdout.write(AN.showCur);
-    process.stdout.write('\n');
+    const passed = tests.length - failed;
+    trace('run_done', { pass: passed, fail: failed });
+    if (HEADLESS) {
+        process.stdout.write(`\n1..${tests.length}\n# pass ${passed}, fail ${failed}\n`);
+    } else {
+        process.stdout.write(AN.showCur + '\n');
+    }
     if (traceStream) traceStream.end();
     process.exit(failed);
 }

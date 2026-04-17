@@ -376,6 +376,48 @@ Object.defineProperty(process, 'platform', {
     configurable: true,
 });
 
+// ── path module active-host dispatch ─────────────────────────
+// path.resolve / join / dirname / basename / isAbsolute / normalize / relative
+// dispatch to path.win32.* or path.posix.* based on the active host's platform.
+// path.sep and path.delimiter become getters. The module object identity is
+// preserved so `const path = require('path')` still works everywhere.
+//
+// Gotcha: on a Mac Node, `path.resolve === path.posix.resolve`, so if we
+// replace `path.resolve` in place, `path.posix.resolve` also gets replaced —
+// leading to infinite recursion when we dispatch back through it. Capture the
+// original platform-specific methods into local refs first.
+(function patchPath() {
+    const path = require('path');
+    const win32 = {}, posix = {};
+    const methods = ['resolve', 'join', 'dirname', 'basename', 'extname',
+                     'isAbsolute', 'normalize', 'relative', 'parse', 'format',
+                     'toNamespacedPath'];
+    // Snapshot original methods from each namespace into local refs
+    for (const m of methods) {
+        if (typeof path.win32[m] === 'function') win32[m] = path.win32[m];
+        if (typeof path.posix[m] === 'function') posix[m] = path.posix[m];
+    }
+    const win32Sep = path.win32.sep, posixSep = path.posix.sep;
+    const win32Delim = path.win32.delimiter, posixDelim = path.posix.delimiter;
+
+    function pickSet() {
+        const h = hosts[activeHost];
+        return (h && h.platform === 'win32') ? win32 : posix;
+    }
+    for (const m of methods) {
+        if (typeof path[m] !== 'function') continue;
+        path[m] = function (...args) { return pickSet()[m](...args); };
+    }
+    Object.defineProperty(path, 'sep', {
+        get() { const h = hosts[activeHost]; return (h && h.platform === 'win32') ? win32Sep : posixSep; },
+        configurable: true,
+    });
+    Object.defineProperty(path, 'delimiter', {
+        get() { const h = hosts[activeHost]; return (h && h.platform === 'win32') ? win32Delim : posixDelim; },
+        configurable: true,
+    });
+})();
+
 // ── Kick off async host_info fetch for the default remote ────
 if (process.env.DUMBTERM_FLOWTO) {
     refreshHostInfo(defaultRemote, (err) => {
