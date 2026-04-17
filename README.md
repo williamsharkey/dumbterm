@@ -204,10 +204,23 @@ Run your app:
 
 ```bash
 cd ~/Desktop/lot
-./dumbterm --flowto 127.0.0.1:9187 -- claude
+./dumbterm --flowto 127.0.0.1:9187 -- node "$(npm root -g)/@anthropic-ai/claude-code/cli.js" --dangerously-skip-permissions
 ```
 
 Now Claude's `Bash` runs in W7's MSYS bash in `/c/workspace/lot`; `Read` of `~/Desktop/lot/main.c` auto-resolves to W7's `/c/workspace/lot/main.c`; its memory and auth stay on Mac.
+
+### ⚠ Important: must be Node-based Claude Code
+
+The shipped macOS `claude` binary is compiled with Bun and **cannot be hooked** by `--require`. If you run `dumbterm --flowto ... -- claude`, flowto prints a warning and runs Claude with *no tool routing* — you'll see Mac's `hostname`, not the agent's.
+
+Install the Node-based version instead:
+
+```bash
+npm install -g @anthropic-ai/claude-code
+dumbterm --flowto HOST:PORT -- node "$(npm root -g)/@anthropic-ai/claude-code/cli.js" ...
+```
+
+Both share `~/.claude/` credentials, so auth is automatic once either is logged in.
 
 ## For other Windows 7 / legacy Windows users
 

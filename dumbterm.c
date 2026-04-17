@@ -3252,7 +3252,11 @@ int main(int argc, char **argv) {
             _NSGetExecutablePath(shim_path, &plen);
             char *sl = strrchr(shim_path, '/');
             if (sl) strcpy(sl + 1, "flowto_shim.js");
-            /* if child is node.exe-ish, inject --require */
+            /* flowto shim only loads in a Node process (via --require).
+               If the child is Node, inject it. Otherwise warn loudly: the
+               user's tool calls will NOT be routed. Most common cause:
+               pointing --flowto at a Bun-compiled `claude` binary instead
+               of `node .../claude-code/cli.js`. */
             if (strstr(child_cmd, "node")) {
                 static char *argv_with_require[64];
                 int ac = 0;
@@ -3263,6 +3267,34 @@ int main(int argc, char **argv) {
                 argv_with_require[ac] = NULL;
                 execvp(child_cmd, argv_with_require);
             } else {
+                fprintf(stderr,
+                    "\n"
+                    "⚠  flowto: child command is '%s' — not a Node process, so the\n"
+                    "   flowto shim cannot be loaded via --require. Tool calls from\n"
+                    "   this child will execute LOCALLY, not on the remote agent.\n"
+                    "\n"
+                    "   For Claude Code specifically: the shipped 'claude' binary on\n"
+                    "   macOS is Bun-compiled and can't be hooked. Use the npm version:\n"
+                    "     npm install -g @anthropic-ai/claude-code\n"
+                    "     dumbterm --flowto HOST:PORT -- node \\\n"
+                    "       \"$(npm root -g)/@anthropic-ai/claude-code/cli.js\" --print ...\n"
+                    "\n"
+                    "   Or override DUMBTERM_FORCE_SHIM=1 to inject anyway (will probably\n"
+                    "   fail unless the child happens to invoke node internally).\n"
+                    "\n"
+                    "   Continuing without shim. Run with --flowto for the shim warning\n"
+                    "   to be visible next time too.\n\n",
+                    child_cmd);
+                if (getenv("DUMBTERM_FORCE_SHIM")) {
+                    static char *argv_with_require[64];
+                    int ac = 0;
+                    argv_with_require[ac++] = (char*)child_cmd;
+                    argv_with_require[ac++] = "--require";
+                    argv_with_require[ac++] = shim_path;
+                    for (int j = 1; child_argv[j]; j++) argv_with_require[ac++] = child_argv[j];
+                    argv_with_require[ac] = NULL;
+                    execvp(child_cmd, argv_with_require);
+                }
                 execvp(child_cmd, child_argv);
             }
             _exit(127);
