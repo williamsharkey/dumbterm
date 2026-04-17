@@ -1,9 +1,11 @@
 // flowto_tester.js — visual + programmatic test harness for flowto.
 //
-// Run:
-//   dumbterm --flowto HOST:PORT -- node tests/flowto_tester.js
-//   dumbterm --flowto HOST:PORT -- node tests/flowto_tester.js --interactive
-//   DUMBTERM_TRACE_LOG=/tmp/trace.jsonl dumbterm --flowto ... -- node tests/flowto_tester.js
+// Run the full suite (requires all virtualizations enabled):
+//   DUMBTERM_VIRTUAL_HOME=1 DUMBTERM_VIRTUAL_CWD=1 DUMBTERM_VIRTUAL_PLATFORM=1 \
+//   DUMBTERM_VIRTUAL_PATH=1 DUMBTERM_VIRTUAL_ENV=1 DUMBTERM_VIRTUAL_FS=1 \
+//   dumbterm --flowto HOST:PORT -- node tests/flowto_tester.js --headless
+//
+// See tests/run_full.sh for the canonical invocation.
 //
 // TUI goes to stdout (watch it in your dumbterm window).
 // Trace goes to DUMBTERM_TRACE_LOG file (or stderr if unset).
@@ -168,15 +170,25 @@ test('dumbterm-at local — one-shot, does not change active', async () => {
     return 'one-shot returned 42, active still remote';
 });
 
-test('os.homedir is /cloud/dumbterm/home', async () => {
+test('os.homedir respects DUMBTERM_VIRTUAL_HOME setting', async () => {
     const h = os.homedir();
-    if (h !== '/cloud/dumbterm/home') throw new Error(h);
-    return h;
+    if (process.env.DUMBTERM_VIRTUAL_HOME === '1') {
+        if (h !== '/cloud/dumbterm/home') throw new Error(`expected cloud, got ${h}`);
+        return `virtual HOME: ${h}`;
+    } else {
+        if (h === '/cloud/dumbterm/home') throw new Error('cloud active but should not be');
+        return `real HOME: ${h}`;
+    }
 });
 
-test('process.env.HOME is /cloud/dumbterm/home', async () => {
-    if (process.env.HOME !== '/cloud/dumbterm/home') throw new Error(process.env.HOME);
-    return process.env.HOME;
+test('process.env.HOME respects DUMBTERM_VIRTUAL_HOME setting', async () => {
+    const h = process.env.HOME;
+    if (process.env.DUMBTERM_VIRTUAL_HOME === '1') {
+        if (h !== '/cloud/dumbterm/home') throw new Error(h);
+    } else {
+        if (h === '/cloud/dumbterm/home') throw new Error('cloud active but should not be');
+    }
+    return h;
 });
 
 test('writeFile then readFile on /cloud/ path', async () => {
@@ -598,13 +610,17 @@ test('process.env.USERNAME is W7 user when remote is active', async () => {
     return `USERNAME=${u}`;
 });
 
-test('process.env.HOME stays /cloud/dumbterm/home regardless of host', async () => {
-    if (process.env.HOME !== '/cloud/dumbterm/home') throw new Error(process.env.HOME);
+test('process.env.HOME behavior across host switches', async () => {
+    const h1 = process.env.HOME;
     await exec('dumbterm-host local');
     const h2 = process.env.HOME;
     await exec('dumbterm-host remote');
-    if (h2 !== '/cloud/dumbterm/home') throw new Error(`local: ${h2}`);
-    return 'HOME pinned to cloud home across switches';
+    if (process.env.DUMBTERM_VIRTUAL_HOME === '1') {
+        if (h1 !== '/cloud/dumbterm/home' || h2 !== '/cloud/dumbterm/home')
+            throw new Error(`virtual HOME not pinned: ${h1}, ${h2}`);
+        return 'virtual HOME pinned to cloud across switches';
+    }
+    return `real HOME: remote=${h1}, local=${h2} (each shows host env)`;
 });
 
 test('switching to local reveals Mac env vars', async () => {

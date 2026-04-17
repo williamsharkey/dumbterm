@@ -221,13 +221,13 @@ child_process.spawn = function (cmd, args, options) {
     const useCmd = meta.oneShotCmd || (args.length ? cmd + ' ' + args.join(' ') : cmd);
 
     if (useHost === 'local') {
-        const savedPlatformDesc = Object.getOwnPropertyDescriptor(process, 'platform');
-        Object.defineProperty(process, 'platform', { value: realPlatform, configurable: true });
-        try {
-            return origSpawn.call(this, cmd, args, options);
-        } finally {
-            if (savedPlatformDesc) Object.defineProperty(process, 'platform', savedPlatformDesc);
+        if (VIRTUAL_PLATFORM_ENABLED) {
+            const savedPlatformDesc = Object.getOwnPropertyDescriptor(process, 'platform');
+            Object.defineProperty(process, 'platform', { value: realPlatform, configurable: true });
+            try { return origSpawn.call(this, cmd, args, options); }
+            finally { if (savedPlatformDesc) Object.defineProperty(process, 'platform', savedPlatformDesc); }
         }
+        return origSpawn.call(this, cmd, args, options);
     }
 
     return makeRemoteChild(useCmd, options);
@@ -251,16 +251,13 @@ child_process.exec = function (command, options, callback) {
     const useCmd = meta.oneShotCmd || command;
 
     if (useHost === 'local') {
-        // Fall through to real Node implementation. Node picks the shell based
-        // on process.platform, but we've overridden that to show the ACTIVE
-        // host's platform. Temporarily revert so spawn picks the correct shell.
-        const savedPlatformDesc = Object.getOwnPropertyDescriptor(process, 'platform');
-        Object.defineProperty(process, 'platform', { value: realPlatform, configurable: true });
-        try {
-            return origExec.call(this, useCmd, options, callback);
-        } finally {
-            if (savedPlatformDesc) Object.defineProperty(process, 'platform', savedPlatformDesc);
+        if (VIRTUAL_PLATFORM_ENABLED) {
+            const savedPlatformDesc = Object.getOwnPropertyDescriptor(process, 'platform');
+            Object.defineProperty(process, 'platform', { value: realPlatform, configurable: true });
+            try { return origExec.call(this, useCmd, options, callback); }
+            finally { if (savedPlatformDesc) Object.defineProperty(process, 'platform', savedPlatformDesc); }
         }
+        return origExec.call(this, useCmd, options, callback);
     }
 
     // Remote: RPC to the gateway. Use virtual cwd of target host (not process.cwd()
@@ -289,6 +286,17 @@ const PERSISTENT_HOST = process.env.DUMBTERM_PERSISTENT_HOST || defaultRemote;
 const CLOUD_PREFIX = '/cloud/dumbterm/';
 const CLOUD_HOME = '/cloud/dumbterm/home';
 const CLOUD_BACKING = process.env.DUMBTERM_CLOUD_BACKING || 'C:\\workspace\\dumbterm-cloud';
+// Virtualization modes — all opt-in so real apps (Claude Code etc.) get
+// minimal interference. Tester sets them all to 1 to exercise the machinery.
+// exec routing stays always-on — that's the core feature.
+const VIRTUAL_HOME_ENABLED     = process.env.DUMBTERM_VIRTUAL_HOME === '1';
+const VIRTUAL_CWD_ENABLED      = process.env.DUMBTERM_VIRTUAL_CWD === '1';
+const VIRTUAL_PLATFORM_ENABLED = process.env.DUMBTERM_VIRTUAL_PLATFORM === '1';
+const VIRTUAL_PATH_ENABLED     = process.env.DUMBTERM_VIRTUAL_PATH === '1';
+const VIRTUAL_ENV_ENABLED      = process.env.DUMBTERM_VIRTUAL_ENV === '1';
+// fs routing — if off, local fs passes through, /cloud/ still routes.
+// If on, any fs call routes per active host's cwd (Phase 2 behavior).
+const VIRTUAL_FS_ENABLED       = process.env.DUMBTERM_VIRTUAL_FS === '1';
 
 function isCloudPath(p) {
     return typeof p === 'string' && p.startsWith('/cloud/');
@@ -304,21 +312,25 @@ function translateCloudPath(p) {
 // Which host should a path go to?
 function routeForPath(p) {
     if (isCloudPath(p)) return PERSISTENT_HOST;
+    // When fs virtualization is off, all non-cloud paths stay local.
+    if (!VIRTUAL_FS_ENABLED) return 'local';
     return activeHost;
 }
 
-// ── Override HOME / os.homedir ───────────────────────────────
-process.env.HOME = CLOUD_HOME;
+// ── Override HOME / os.homedir (opt-in) ──────────────────────
 const os = require('os');
-const origHomedir = os.homedir;
-os.homedir = () => CLOUD_HOME;
-os.userInfo = (function(orig) {
-    return function(opts) {
-        const r = orig.call(this, opts);
-        r.homedir = CLOUD_HOME;
-        return r;
-    };
-})(os.userInfo);
+if (VIRTUAL_HOME_ENABLED) {
+    process.env.HOME = CLOUD_HOME;
+    const origHomedir = os.homedir;
+    os.homedir = () => CLOUD_HOME;
+    os.userInfo = (function(orig) {
+        return function(opts) {
+            const r = orig.call(this, opts);
+            r.homedir = CLOUD_HOME;
+            return r;
+        };
+    })(os.userInfo);
+}
 
 // ── Intercept fs.* ───────────────────────────────────────────
 const fs = require('fs');
@@ -453,43 +465,31 @@ fs.promises.unlink = (path) => new Promise((res, rej) =>
 fs.promises.mkdir = (path, opts) => new Promise((res, rej) =>
     fs.mkdir(path, opts, (err) => err ? rej(err) : res()));
 
-// ── Override process.cwd / process.chdir ─────────────────────
-// Return the virtual cwd of the active host. Without Phase 3, Node's real
-// process.cwd() returns the driver's (Mac's) cwd, which leaks Mac paths into
-// code expecting Windows paths.
-process.cwd = function () {
-    const h = hosts[activeHost];
-    if (h && h.cwd) return h.cwd;
-    return origProcess.cwd();
-};
-process.chdir = function (path) {
-    const h = hosts[activeHost];
-    if (!h) throw new Error('unknown host');
-    if (h.kind === 'local') {
-        origProcess.chdir(path);
-        h.cwd = origProcess.cwd();
-        return;
-    }
-    // Remote: verify via stat, then record as virtual cwd
-    // For async correctness in the legacy-sync process.chdir API, we do a
-    // synchronous-ish call: fire RPC and assume success. If path is wrong,
-    // subsequent exec will fail visibly.
-    h.cwd = path;
-};
-
-// ── path.win32 swap when active host is win32 ────────────────
-// path module is imported once. Rather than swap globally (breaks Node internals),
-// we expose helpers for code that cares: path.resolve / path.join / etc. stay
-// as-is. Scripts that need remote-style paths can use require('path').win32.
-// The /cloud/... prefix and fs intercepts already do the right thing.
-// For Phase 3 we additionally expose process.platform as the active host's platform:
-Object.defineProperty(process, 'platform', {
-    get() {
+// ── Override process.cwd / process.chdir (opt-in) ────────────
+if (VIRTUAL_CWD_ENABLED) {
+    process.cwd = function () {
         const h = hosts[activeHost];
-        return (h && h.platform) || 'darwin';
-    },
-    configurable: true,
-});
+        if (h && h.cwd) return h.cwd;
+        return origProcess.cwd();
+    };
+    process.chdir = function (path) {
+        const h = hosts[activeHost];
+        if (!h) throw new Error('unknown host');
+        if (h.kind === 'local') { origProcess.chdir(path); h.cwd = origProcess.cwd(); return; }
+        h.cwd = path;
+    };
+}
+
+// ── process.platform override (opt-in) ───────────────────────
+if (VIRTUAL_PLATFORM_ENABLED) {
+    Object.defineProperty(process, 'platform', {
+        get() {
+            const h = hosts[activeHost];
+            return (h && h.platform) || 'darwin';
+        },
+        configurable: true,
+    });
+}
 
 // ── path module active-host dispatch ─────────────────────────
 // path.resolve / join / dirname / basename / isAbsolute / normalize / relative
@@ -501,7 +501,7 @@ Object.defineProperty(process, 'platform', {
 // replace `path.resolve` in place, `path.posix.resolve` also gets replaced —
 // leading to infinite recursion when we dispatch back through it. Capture the
 // original platform-specific methods into local refs first.
-(function patchPath() {
+if (VIRTUAL_PATH_ENABLED) (function patchPath() {
     const path = require('path');
     const win32 = {}, posix = {};
     const methods = ['resolve', 'join', 'dirname', 'basename', 'extname',
@@ -543,10 +543,10 @@ function envForHost() {
     const h = hosts[activeHost];
     return (h && h.env) || realEnv;
 }
-(function patchEnv() {
+if (VIRTUAL_ENV_ENABLED) (function patchEnv() {
     const envProxy = new Proxy({}, {
         get(_, key) {
-            if (key === 'HOME') return CLOUD_HOME;
+            if (key === 'HOME' && VIRTUAL_HOME_ENABLED) return CLOUD_HOME;
             const e = envForHost();
             if (key in e) return e[key];
             return realEnv[key];
