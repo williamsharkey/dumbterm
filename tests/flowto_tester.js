@@ -392,6 +392,64 @@ test('exec with no output returns empty string', async () => {
     return 'empty stdout = ""';
 });
 
+// ── Phase 3: cwd / platform virtualization ──────────────────
+
+test('process.platform reflects remote host', async () => {
+    // Give host_info a chance to arrive
+    await new Promise(r => setTimeout(r, 300));
+    const p = process.platform;
+    if (p !== 'win32') throw new Error(`expected win32 (W7 agent), got: ${p}`);
+    return `process.platform = ${p}`;
+});
+
+test('process.cwd() returns a W7-style path when remote is active', async () => {
+    const c = process.cwd();
+    // W7 paths contain drive letter colon + backslash (or are in C:\)
+    if (!c.match(/^[A-Z]:\\/) && !c.startsWith('C:')) throw new Error(`non-Windows cwd: ${c}`);
+    return `cwd = ${c}`;
+});
+
+test('switching to local reveals local cwd', async () => {
+    await exec('dumbterm-host local');
+    const c = process.cwd();
+    await exec('dumbterm-host remote');
+    if (c.match(/^[A-Z]:\\/)) throw new Error(`still a W7 path: ${c}`);
+    return `local cwd = ${c}`;
+});
+
+test('process.platform follows active host (local=darwin)', async () => {
+    await exec('dumbterm-host local');
+    const p = process.platform;
+    await exec('dumbterm-host remote');
+    if (p === 'win32') throw new Error('still win32');
+    return `local platform = ${p}`;
+});
+
+test('process.chdir updates virtual cwd; exec reflects it', async () => {
+    // Use a known W7 directory
+    const target = 'C:\\workspace';
+    process.chdir(target);
+    // Now run a cmd that prints cwd — "cd" with no args on Windows
+    const r = await exec('cd');
+    const reported = r.out.trim();
+    process.chdir('C:\\'); // reset for later tests
+    if (!reported.toLowerCase().startsWith('c:\\workspace')) throw new Error(`reported: ${reported}`);
+    return `chdir worked: ${reported}`;
+});
+
+test('cwd is per-host: switching restores each host\'s cwd', async () => {
+    // on remote, chdir to C:\workspace
+    process.chdir('C:\\workspace');
+    const remoteCwd = process.cwd();
+    await exec('dumbterm-host local');
+    const localCwd = process.cwd();
+    await exec('dumbterm-host remote');
+    const remoteAgain = process.cwd();
+    if (remoteCwd !== remoteAgain) throw new Error(`drifted: ${remoteCwd} vs ${remoteAgain}`);
+    if (localCwd.match(/^[A-Z]:\\/)) throw new Error(`local got W7 path: ${localCwd}`);
+    return `remote ${remoteCwd}, local ${localCwd}, remote restored correctly`;
+});
+
 // Cleanup tests
 test('cleanup cloud test files', async () => {
     await unlink('/cloud/dumbterm/tester_smoke.txt');

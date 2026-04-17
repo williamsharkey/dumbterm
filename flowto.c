@@ -314,6 +314,25 @@ static void agent_handle_request(sock_t s, const char *req) {
         char msg[512];
         snprintf(msg, sizeof(msg), "{\"id\":%d,\"ok\":true,\"host\":\"%s\"}", id, host);
         rpc_write_line(s, msg);
+    } else if (strcmp(op, "host_info") == 0) {
+        char hostname[256] = "unknown";
+        gethostname(hostname, sizeof(hostname));
+        char cwd[2048]; cwd[0] = 0;
+        if (!getcwd(cwd, sizeof(cwd))) strcpy(cwd, ".");
+#ifdef _WIN32
+        const char *plat = "win32";
+        const char *sep = "\\\\"; /* backslash, escaped for JSON */
+#else
+        const char *plat = "darwin";
+        const char *sep = "/";
+#endif
+        char cwd_esc[4096]; json_escape(cwd_esc, cwd);
+        char host_esc[512]; json_escape(host_esc, hostname);
+        char msg[8192];
+        snprintf(msg, sizeof(msg),
+            "{\"id\":%d,\"ok\":true,\"hostname\":\"%s\",\"cwd\":\"%s\",\"platform\":\"%s\",\"sep\":\"%s\"}",
+            id, host_esc, cwd_esc, plat, sep);
+        rpc_write_line(s, msg);
     } else if (strcmp(op, "exec") == 0) {
         char *cmd = json_str(req, "cmd");
         char *cwd = json_str(req, "cwd");

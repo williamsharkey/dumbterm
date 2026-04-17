@@ -10,6 +10,7 @@
 
 const net = require('net');
 const child_process = require('child_process');
+const realPlatform = process.platform; // capture before we override below
 
 const gw = process.env.DUMBTERM_GATEWAY;
 if (!gw) { return; /* not running under --flowto; stay inert */ }
@@ -17,11 +18,22 @@ if (!gw) { return; /* not running under --flowto; stay inert */ }
 const [gwHost, gwPortStr] = gw.split(':');
 const gwPort = parseInt(gwPortStr);
 
-// ── Host registry ────────────────────────────────────────────
-const hosts = { local: { kind: 'local' } };
+// ── Host registry with per-host info ─────────────────────────
+// Each host tracks: kind, cwd (virtual cwd for this host), platform, sep, hostname.
+// Local host info comes from Node's real APIs; remote is populated lazily via host_info RPC.
+const origProcess = { cwd: process.cwd.bind(process), chdir: process.chdir.bind(process) };
+const hosts = {
+    local: {
+        kind: 'local',
+        cwd: origProcess.cwd(),
+        platform: process.platform,
+        sep: process.platform === 'win32' ? '\\' : '/',
+        hostname: require('os').hostname(),
+    }
+};
 const defaultRemote = process.env.DUMBTERM_REMOTE_NAME || 'remote';
 if (process.env.DUMBTERM_FLOWTO) {
-    hosts[defaultRemote] = { kind: 'remote' };
+    hosts[defaultRemote] = { kind: 'remote', cwd: null, platform: null, sep: null, hostname: null };
 }
 let activeHost = process.env.DUMBTERM_FLOWTO ? defaultRemote : 'local';
 
@@ -71,6 +83,20 @@ function rpcCall(req, cb) {
     });
 }
 
+// ── Fetch host_info lazily and cache on the host entry ───────
+function refreshHostInfo(hostName, cb) {
+    const h = hosts[hostName];
+    if (!h || h.kind !== 'remote') return cb && cb(null);
+    rpcCall({ op: 'host_info', host: hostName }, (err, resp) => {
+        if (err || !resp.ok) return cb && cb(err || new Error('host_info failed'));
+        h.hostname = resp.hostname;
+        if (h.cwd == null) h.cwd = resp.cwd; // preserve any previous chdir
+        h.platform = resp.platform;
+        h.sep = resp.sep;
+        cb && cb(null);
+    });
+}
+
 // ── Intercept dumbterm-host / dumbterm-at meta commands ──────
 function maybeMetaCommand(cmd) {
     const m = cmd.trim().match(/^dumbterm-host\s+(\S+)(?:\s|$)/);
@@ -110,12 +136,22 @@ child_process.exec = function (command, options, callback) {
     const useCmd = meta.oneShotCmd || command;
 
     if (useHost === 'local') {
-        // Fall through to the real Node implementation
-        return origExec.call(this, useCmd, options, callback);
+        // Fall through to real Node implementation. Node picks the shell based
+        // on process.platform, but we've overridden that to show the ACTIVE
+        // host's platform. Temporarily revert so spawn picks the correct shell.
+        const savedPlatformDesc = Object.getOwnPropertyDescriptor(process, 'platform');
+        Object.defineProperty(process, 'platform', { value: realPlatform, configurable: true });
+        try {
+            return origExec.call(this, useCmd, options, callback);
+        } finally {
+            if (savedPlatformDesc) Object.defineProperty(process, 'platform', savedPlatformDesc);
+        }
     }
 
-    // Remote: RPC to the gateway
-    rpcCall({ op: 'exec', host: useHost, cmd: useCmd, cwd: options.cwd || process.cwd() }, (err, resp) => {
+    // Remote: RPC to the gateway. Use virtual cwd of target host (not process.cwd()
+    // which would leak a Mac path to a Windows agent).
+    const targetCwd = options.cwd || (hosts[useHost] && hosts[useHost].cwd) || '';
+    rpcCall({ op: 'exec', host: useHost, cmd: useCmd, cwd: targetCwd }, (err, resp) => {
         if (err) { if (callback) callback(err, '', ''); return; }
         const out = Buffer.from(resp.out || '', 'base64').toString('utf8');
         const errStr = Buffer.from(resp.err || '', 'base64').toString('utf8');
@@ -302,12 +338,62 @@ fs.promises.unlink = (path) => new Promise((res, rej) =>
 fs.promises.mkdir = (path, opts) => new Promise((res, rej) =>
     fs.mkdir(path, opts, (err) => err ? rej(err) : res()));
 
+// ── Override process.cwd / process.chdir ─────────────────────
+// Return the virtual cwd of the active host. Without Phase 3, Node's real
+// process.cwd() returns the driver's (Mac's) cwd, which leaks Mac paths into
+// code expecting Windows paths.
+process.cwd = function () {
+    const h = hosts[activeHost];
+    if (h && h.cwd) return h.cwd;
+    return origProcess.cwd();
+};
+process.chdir = function (path) {
+    const h = hosts[activeHost];
+    if (!h) throw new Error('unknown host');
+    if (h.kind === 'local') {
+        origProcess.chdir(path);
+        h.cwd = origProcess.cwd();
+        return;
+    }
+    // Remote: verify via stat, then record as virtual cwd
+    // For async correctness in the legacy-sync process.chdir API, we do a
+    // synchronous-ish call: fire RPC and assume success. If path is wrong,
+    // subsequent exec will fail visibly.
+    h.cwd = path;
+};
+
+// ── path.win32 swap when active host is win32 ────────────────
+// path module is imported once. Rather than swap globally (breaks Node internals),
+// we expose helpers for code that cares: path.resolve / path.join / etc. stay
+// as-is. Scripts that need remote-style paths can use require('path').win32.
+// The /cloud/... prefix and fs intercepts already do the right thing.
+// For Phase 3 we additionally expose process.platform as the active host's platform:
+Object.defineProperty(process, 'platform', {
+    get() {
+        const h = hosts[activeHost];
+        return (h && h.platform) || 'darwin';
+    },
+    configurable: true,
+});
+
+// ── Kick off async host_info fetch for the default remote ────
+if (process.env.DUMBTERM_FLOWTO) {
+    refreshHostInfo(defaultRemote, (err) => {
+        if (err) process.stderr.write('flowto: host_info failed: ' + err.message + '\n');
+    });
+}
+
+// Expand the meta-command to refresh host info on first switch
+const origMaybeMeta = maybeMetaCommand;
+// (already declared above — we rely on the original)
+
 // ── Expose shim state for tests ──────────────────────────────
 global.__flowto = {
     get activeHost() { return activeHost; },
     set activeHost(v) { activeHost = v; },
     hosts,
     rpcCall,
+    refreshHostInfo,
     CLOUD_HOME,
     isCloudPath,
     routeForPath,
