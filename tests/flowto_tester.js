@@ -688,31 +688,27 @@ test('context file reports active host', async () => {
 // whole Bash invocation as "empty output". Verify the read routes back to the
 // host where the spawn ran.
 
-test('claude /tmp/claude-*-cwd sentinel: write-via-spawn then readback routes to remote', async () => {
+test('claude /tmp/claude-*-cwd sentinel: pre-written locally during spawn', async () => {
+    // Current design: when the shim sees `pwd -P >| /tmp/claude-*-cwd` in a
+    // spawn command, it pre-writes the sentinel on LOCAL /tmp with the
+    // remote host's cwd (translated back via pathMap). Claude's synchronous
+    // readFileSync then finds the file where it expects. Verify that flow.
     const sentinel = '/tmp/claude-flowtotest-' + Date.now() + '-cwd';
-    // Mimic Claude's script: pwd -P >| /tmp/claude-XXXX-cwd
-    const cmdStr = `bash -c "pwd -P >| ${sentinel}; echo SPAWN_DONE"`;
-    // Use /bin/bash -c via the spawn(cmd, args) signature that detectShellDashC matches
+    // Clean before
+    try { require('fs').unlinkSync(sentinel); } catch (e) {}
     const bashArgs = ['-c', `pwd -P >| ${sentinel}; echo SPAWN_DONE`];
     await new Promise((resolve, reject) => {
         const child = cp.spawn('/bin/bash', bashArgs);
         let out = '';
         child.stdout.on('data', d => out += d.toString());
-        child.on('exit', code => {
-            if (code !== 0) return reject(new Error(`spawn exit ${code}, out=${out}`));
-            if (!out.includes('SPAWN_DONE')) return reject(new Error(`no SPAWN_DONE, out=${out}`));
-            resolve();
-        });
+        child.on('exit', code => code === 0 && out.includes('SPAWN_DONE') ? resolve() : reject(new Error(`spawn ${code} out=${out}`)));
         child.on('error', reject);
     });
-    // Now read the sentinel — this should route to the host where the spawn ran.
-    const contents = await new Promise((resolve, reject) => {
-        fs.readFile(sentinel, 'utf8', (err, data) => err ? reject(err) : resolve(data));
-    });
-    if (!contents || contents.length === 0) throw new Error('sentinel file empty');
-    // Cleanup (also via remote)
-    await new Promise((resolve) => fs.unlink(sentinel, () => resolve()));
-    return `sentinel readback: ${JSON.stringify(contents.trim())}`;
+    // Sentinel should exist on Mac's /tmp (pre-written during spawn).
+    const contents = require('fs').readFileSync(sentinel, 'utf8');
+    if (!contents.length) throw new Error('sentinel empty');
+    try { require('fs').unlinkSync(sentinel); } catch (e) {}
+    return `pre-written sentinel: ${JSON.stringify(contents.trim())}`;
 });
 
 // ── Phase 14: spawn stdin (currently disabled; driver-side passthrough TBD) ──

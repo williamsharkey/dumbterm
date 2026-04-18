@@ -374,6 +374,28 @@ function makeRemoteChild(cmdString, options) {
     // CreateProcessA on W7 can't resolve /usr/bin/*. __flowtoShell comes in
     // pre-quoted and can be used as-is; raw shell strings need rewriting.
     const shell = options.__flowtoShell ? rawShell : rewriteShellPath(rawShell);
+    // Claude Code's Bash tool passes stdio:["pipe", fd, fd] — stdout and
+    // stderr redirect to a LOCAL file descriptor the tool already opened.
+    // Remote children can't redirect to a Mac fd, so we capture the fd and
+    // write incoming remote data to it ourselves.
+    //
+    // Critical: Claude closes its own reference to the fd right after spawn
+    // (via `await S.close()`). After close, fd N becomes invalid/reusable —
+    // writing to it either fails or hits someone else's file. Solve by
+    // dup'ing the fd NOW via fs.openSync('/dev/fd/N', 'a') so we hold our
+    // own independent reference. The dup stays valid even after Claude's
+    // close; the OS keeps the underlying file alive while either ref is open.
+    let outFd = null, errFd = null;
+    const fsMod = require('fs');
+    if (Array.isArray(options.stdio)) {
+        const dupFd = (n) => {
+            if (typeof n !== 'number' || n < 0) return null;
+            try { return fsMod.openSync('/dev/fd/' + n, 'a'); }
+            catch (e) { TRACE('FD_DUP_FAIL', { fd: n, err: e.message }); return null; }
+        };
+        outFd = dupFd(options.stdio[1]);
+        errFd = dupFd(options.stdio[2]);
+    }
     const child = new EventEmitter();
     const stdoutStream = new Readable({ read() {} });
     const stderrStream = new Readable({ read() {} });
@@ -422,15 +444,21 @@ function makeRemoteChild(cmdString, options) {
         }
         if (msg.stream === 'out' && msg.data) {
             const b = Buffer.from(msg.data, 'base64');
-            TRACE('REMOTE_STDOUT', { pid: child.pid, len: b.length, data: b.toString('utf8').slice(0, 50) });
+            TRACE('REMOTE_STDOUT', { pid: child.pid, len: b.length, data: b.toString('utf8').slice(0, 50), outFd });
             stdoutStream.push(b);
+            if (outFd != null) { try { require('fs').writeSync(outFd, b); } catch (e) { TRACE('FD_WRITE_FAIL', { outFd, err: e.message }); } }
         } else if (msg.stream === 'err' && msg.data) {
             const b = Buffer.from(msg.data, 'base64');
-            TRACE('REMOTE_STDERR', { pid: child.pid, len: b.length });
+            TRACE('REMOTE_STDERR', { pid: child.pid, len: b.length, errFd });
             stderrStream.push(b);
+            if (errFd != null) { try { require('fs').writeSync(errFd, b); } catch (e) { TRACE('FD_WRITE_FAIL', { errFd, err: e.message }); } }
         } else if ('exit' in msg) {
             TRACE('REMOTE_EXIT', { pid: child.pid, code: msg.exit });
             child.exitCode = msg.exit;
+            // Close our dup'd fds so Claude's append-write-read file
+            // sequence sees a flushed, consistent file.
+            if (outFd != null) { try { fsMod.closeSync(outFd); } catch (e) {} outFd = null; }
+            if (errFd != null && errFd !== outFd) { try { fsMod.closeSync(errFd); } catch (e) {} errFd = null; }
             // Delay the exit+close emits so any same-tick data pushes flush
             // through the stream's internal buffer first. Without this,
             // consumers (e.g. Claude Code's Bash tool which attaches the
@@ -453,7 +481,12 @@ child_process.spawn = function (cmd, args, options) {
     if (Array.isArray(args)) { options = options || {}; }
     else if (typeof args === 'object' && args !== null) { options = args; args = []; }
     else { args = []; options = options || {}; }
-    TRACE('SPAWN', { cmd, args: Array.isArray(args) ? args.slice(0, 8) : args });
+    TRACE('SPAWN', {
+        cmd,
+        args: Array.isArray(args) ? args.slice(0, 8) : args,
+        stdio: options.stdio,
+        cwd: options.cwd,
+    });
 
     const meta = maybeMetaCommand(cmd);
     if (meta.handled) {
