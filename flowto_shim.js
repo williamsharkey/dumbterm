@@ -332,9 +332,38 @@ const origSpawn = child_process.spawn;
 const { Readable, Writable } = require('stream');
 const EventEmitter = require('events');
 
+// Claude Code's Bash tool injects `pwd -P >| /tmp/claude-XXXX-cwd` into every
+// shell invocation so it can read the post-command cwd back. When the script
+// runs remotely the file lives on the remote host; Claude then reads it on
+// Mac via readFileSync and ENOENTs — and treats the whole Bash invocation as
+// failed, even when stdout is fine. Workaround: pre-write the sentinel
+// LOCALLY with the remote host's current cwd before the spawn runs. If the
+// script cd's somewhere, the cwd will be slightly stale but Claude only uses
+// it as a hint anyway.
+function preWriteClaudeSentinel(cmdString, remoteCwd) {
+    if (typeof cmdString !== 'string') return;
+    const m = cmdString.match(/pwd\s+-P\s*>\|?\s*(\/tmp\/claude-[^\s]+-cwd)/);
+    if (!m) return;
+    const sentinelPath = m[1];
+    // Map remote cwd back to local form via pathMap so Claude's cwd-tracking
+    // sees the path *it originally handed us*, not the W7 form.
+    let cwd = remoteCwd || '/';
+    if (PATH_TRANSLATE_ENABLED && pathMap.length && typeof cwd === 'string') {
+        for (const [local, remote] of pathMap) {
+            if (cwd.startsWith(remote)) { cwd = local + cwd.slice(remote.length); break; }
+        }
+    }
+    const content = cwd + '\n';
+    try {
+        require('fs').writeFileSync(sentinelPath, content);
+        TRACE('SENTINEL_PREWRITE', { path: sentinelPath, cwd });
+    } catch (e) { TRACE('SENTINEL_PREWRITE_FAIL', { path: sentinelPath, err: e.message }); }
+}
+
 function makeRemoteChild(cmdString, options) {
     const useHost = options.__flowtoHost || activeHost;
     lastRemoteSpawnHost = useHost;
+    preWriteClaudeSentinel(cmdString, (hosts[useHost] && hosts[useHost].cwd) || options.cwd);
     let cwd = options.cwd || (hosts[useHost] && hosts[useHost].cwd) || '';
     cwd = translateForHost(cwd, useHost);
     const rawShell = options.__flowtoShell
@@ -367,6 +396,10 @@ function makeRemoteChild(cmdString, options) {
     child.stdout = stdoutStream;
     child.stderr = stderrStream;
     child.stdin = stdinStream;
+    // Node's ChildProcess exposes stdio as an array too. Consumers that
+    // access .stdio[0/1/2] (common with execa-style libraries) get the right
+    // streams this way.
+    child.stdio = [stdinStream, stdoutStream, stderrStream];
     child.pid = null;
     child.killed = false;
     child.exitCode = null;
@@ -388,15 +421,28 @@ function makeRemoteChild(cmdString, options) {
             return;
         }
         if (msg.stream === 'out' && msg.data) {
-            stdoutStream.push(Buffer.from(msg.data, 'base64'));
+            const b = Buffer.from(msg.data, 'base64');
+            TRACE('REMOTE_STDOUT', { pid: child.pid, len: b.length, data: b.toString('utf8').slice(0, 50) });
+            stdoutStream.push(b);
         } else if (msg.stream === 'err' && msg.data) {
-            stderrStream.push(Buffer.from(msg.data, 'base64'));
+            const b = Buffer.from(msg.data, 'base64');
+            TRACE('REMOTE_STDERR', { pid: child.pid, len: b.length });
+            stderrStream.push(b);
         } else if ('exit' in msg) {
+            TRACE('REMOTE_EXIT', { pid: child.pid, code: msg.exit });
             child.exitCode = msg.exit;
-            stdoutStream.push(null);
-            stderrStream.push(null);
-            child.emit('exit', msg.exit, null);
-            child.emit('close', msg.exit, null);
+            // Delay the exit+close emits so any same-tick data pushes flush
+            // through the stream's internal buffer first. Without this,
+            // consumers (e.g. Claude Code's Bash tool which attaches the
+            // 'data' handler inside a Promise resolved on 'exit') can see
+            // 'exit' fire before the last push is dispatched and conclude
+            // the command produced no output.
+            setImmediate(() => {
+                stdoutStream.push(null);
+                stderrStream.push(null);
+                child.emit('exit', msg.exit, null);
+                child.emit('close', msg.exit, null);
+            });
         }
     });
     return child;
@@ -629,6 +675,30 @@ function rpcToHost(host, req, cb) {
     rpcCall(req, cb);
     return true;
 }
+
+// Sync variants: intercept so sentinel & pathMap routing works for readFileSync too.
+// Claude Code's Bash tool reads /tmp/claude-XXXX-cwd synchronously after a spawn;
+// without this wrapper it goes straight to Mac's local /tmp and ENOENTs.
+const origReadFileSync = fs.readFileSync;
+fs.readFileSync = function (path, opts) {
+    const host = routeForPath(path);
+    TRACE('READFILESYNC', { path, host });
+    if (host === 'local') return origReadFileSync.call(this, path, opts);
+    // Remote sync read: must block. Use Atomics.wait via a worker thread or
+    // fall back to best-effort by making the call async + busy-waiting is
+    // not safe. Simplest: use child_process.execFileSync to block via a
+    // helper one-liner that does the TCP read. For now we use a synchronous
+    // trick: deasync-style event loop pump isn't in Node core, so we settle
+    // for origReadFileSync on the LOCAL path and let Claude see ENOENT —
+    // which at least tells Claude "sentinel missing" and it falls back to
+    // not tracking cwd (its Bash tool still returns stdout normally).
+    return origReadFileSync.call(this, path, opts);
+};
+const origStatSync = fs.statSync;
+fs.statSync = function (path, opts) {
+    TRACE('STATSYNC', { path, host: routeForPath(path) });
+    return origStatSync.call(this, path, opts);
+};
 
 // fs.readFile(path, [opts], cb)
 const origReadFile = fs.readFile;
