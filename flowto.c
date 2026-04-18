@@ -227,18 +227,13 @@ static const char *resolve_shell(const char *shell_hint) {
 #endif
 }
 
-/* Build "SHELL CMD" where CMD is properly quoted. Caller frees. */
+/* Build "SHELL CMD" where CMD is properly quoted. Caller frees.
+   shell may be: "cmd.exe /c", "/bin/sh -c", or '"C:\Path With Space\bash.exe" -c'.
+   We treat shell as a literal prefix and append ' "CMD"'. */
 static char *build_shell_cmdline(const char *shell, const char *cmd) {
     int cap = strlen(shell) + strlen(cmd) + 32;
     char *out = (char*)malloc(cap);
-    /* Split shell on first space: e.g. "bash -c" or "C:\msys64\usr\bin\bash.exe -c" */
-    const char *sp = strchr(shell, ' ');
-    if (sp) {
-        snprintf(out, cap, "%s \"%s\"", shell, cmd);
-    } else {
-        /* bare shell path — assume -c convention */
-        snprintf(out, cap, "%s -c \"%s\"", shell, cmd);
-    }
+    snprintf(out, cap, "%s \"%s\"", shell, cmd);
     return out;
 }
 

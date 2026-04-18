@@ -37,6 +37,11 @@ if (process.env.DUMBTERM_FLOWTO) {
 }
 let activeHost = process.env.DUMBTERM_FLOWTO ? defaultRemote : 'local';
 
+// Track the host where the most recent remote spawn ran. Used to route
+// Claude-Code-style sentinel file reads (e.g. /tmp/claude-XXXX-cwd) to
+// the same host where the bash script wrote them.
+let lastRemoteSpawnHost = null;
+
 // ── .flowto.json project profile loader ─────────────────────
 // Walk up from cwd looking for .flowto.json. Load:
 //   defaultHost, remoteCwd, remoteShell, pathMap[[local,remote],...],
@@ -81,6 +86,90 @@ if (projectCfg.defaultHost) activeHost = projectCfg.defaultHost;
 
 // pathMap: [[localPrefix, remotePrefix], ...]
 const pathMap = Array.isArray(projectCfg.pathMap) ? projectCfg.pathMap : [];
+
+// localCommands: shells out that should NEVER route to the remote agent.
+// Apps like Claude Code call platform bootstrap tools (security, codesign,
+// ioreg, where.exe, etc.) during init — if these route to a foreign host
+// they fail silently and the app misbehaves (e.g. "Not logged in" because
+// `security find-generic-password` for Keychain creds goes to W7).
+const LOCAL_CMDS_BUILTIN = [
+    // macOS bootstrap tools
+    'security', 'codesign', 'sw_vers', 'ioreg', 'scutil', 'defaults',
+    'launchctl', 'plutil', 'networksetup', 'osascript',
+    // Windows bootstrap tools (when Mac happens to probe for them)
+    'where', 'where.exe', 'reg', 'reg.exe', 'wmic', 'wmic.exe',
+    'systeminfo', 'powershell', 'powershell.exe',
+];
+const LOCAL_CMDS_USER = Array.isArray(projectCfg.localCommands) ? projectCfg.localCommands : [];
+const LOCAL_CMDS = new Set([...LOCAL_CMDS_BUILTIN, ...LOCAL_CMDS_USER]);
+
+// localPathPrefixes: executable paths that are inherently host-local.
+const LOCAL_PATH_PREFIXES_BUILTIN = ['/opt/homebrew/', '/System/', '/Applications/'];
+const LOCAL_PATH_PREFIXES_USER = Array.isArray(projectCfg.localPathPrefixes) ? projectCfg.localPathPrefixes : [];
+const LOCAL_PATH_PREFIXES = [...LOCAL_PATH_PREFIXES_BUILTIN, ...LOCAL_PATH_PREFIXES_USER];
+
+function shouldRunLocal(cmd) {
+    if (typeof cmd !== 'string') return false;
+    // basename of first token
+    const first = cmd.trim().split(/\s+/)[0] || '';
+    const base = first.split('/').pop().split('\\').pop();
+    if (LOCAL_CMDS.has(base) || LOCAL_CMDS.has(first)) return true;
+    for (const prefix of LOCAL_PATH_PREFIXES) {
+        if (first.startsWith(prefix)) return true;
+    }
+    return false;
+}
+
+// commandMap: rewrite the first token of a remote-bound command.
+// Claude Code's Bash tool often invokes absolute POSIX paths like /bin/bash
+// or /bin/zsh that don't exist on W7; this rewrites them to the MSYS bash
+// equivalent. zsh on W7 doesn't exist — bash happens to run zsh-style scripts
+// fine for Claude's use case.
+// Values MUST be native Windows paths (backslashes, drive letter) — CreateProcessA
+// on W7 can't resolve MSYS-style /c/... paths. Only the MSYS bash itself
+// understands those; for CreateProcessA we need C:\...
+const COMMAND_MAP_DEFAULTS = {
+    '/bin/bash': 'C:\\Program Files\\Git\\usr\\bin\\bash.exe',
+    '/bin/zsh':  'C:\\Program Files\\Git\\usr\\bin\\bash.exe',
+    '/bin/sh':   'C:\\Program Files\\Git\\usr\\bin\\sh.exe',
+    '/usr/bin/bash': 'C:\\Program Files\\Git\\usr\\bin\\bash.exe',
+    '/usr/bin/zsh':  'C:\\Program Files\\Git\\usr\\bin\\bash.exe',
+    '/usr/bin/env':  'C:\\Program Files\\Git\\usr\\bin\\env.exe',
+    '/usr/bin/git':  'C:\\Program Files\\Git\\cmd\\git.exe',
+};
+const COMMAND_MAP_USER = (projectCfg.commandMap && typeof projectCfg.commandMap === 'object') ? projectCfg.commandMap : {};
+const COMMAND_MAP = Object.assign({}, COMMAND_MAP_DEFAULTS, COMMAND_MAP_USER);
+
+function rewriteCommandFirstToken(cmd) {
+    if (typeof cmd !== 'string') return cmd;
+    const tokens = cmd.match(/^(\S+)(\s[\s\S]*)?$/);
+    if (!tokens) return cmd;
+    const first = tokens[1];
+    const rest = tokens[2] || '';
+    if (COMMAND_MAP[first]) return '"' + COMMAND_MAP[first] + '"' + rest;
+    return cmd;
+}
+
+// Detect the "shell -c SCRIPT" invocation pattern used by Claude Code's Bash
+// tool. When found, rewrite so the agent invokes the mapped bash DIRECTLY
+// (bypassing the outer cmd.exe wrap). Otherwise cmd.exe chokes on bash-isms
+// like `>|`, `&&`, or multi-line heredocs.
+const SHELL_INVOKERS = new Set([
+    '/bin/zsh', '/bin/bash', '/bin/sh',
+    '/usr/bin/bash', '/usr/bin/zsh', '/usr/bin/sh',
+    'zsh', 'bash', 'sh',
+]);
+
+// Returns { script, shell } if pattern matched; null otherwise.
+// Only applies to cmd+args signature (spawn), not a pre-joined string.
+function detectShellDashC(cmd, args) {
+    if (!SHELL_INVOKERS.has(cmd)) return null;
+    if (!Array.isArray(args) || args.length < 2) return null;
+    if (args[0] !== '-c') return null;
+    const script = args.slice(1).join(' ');
+    const mappedPath = COMMAND_MAP[cmd] || 'C:\\Program Files\\Git\\usr\\bin\\bash.exe';
+    return { script, shell: '"' + mappedPath + '" -c' };
+}
 
 // ── RPC connection (synchronous on a dedicated socket) ───────
 // We need synchronous-style RPC because child_process.execSync must block.
@@ -196,10 +285,14 @@ const { Readable, Writable } = require('stream');
 const EventEmitter = require('events');
 
 function makeRemoteChild(cmdString, options) {
-    const useHost = activeHost;
+    const useHost = options.__flowtoHost || activeHost;
+    lastRemoteSpawnHost = useHost;
     let cwd = options.cwd || (hosts[useHost] && hosts[useHost].cwd) || '';
     cwd = translateForHost(cwd, useHost);
-    const shell = (hosts[useHost] && hosts[useHost].shell) || process.env.DUMBTERM_REMOTE_SHELL || '';
+    const shell = options.__flowtoShell
+        || (hosts[useHost] && hosts[useHost].shell)
+        || process.env.DUMBTERM_REMOTE_SHELL
+        || '';
     const child = new EventEmitter();
     const stdoutStream = new Readable({ read() {} });
     const stderrStream = new Readable({ read() {} });
@@ -228,7 +321,8 @@ function makeRemoteChild(cmdString, options) {
     child.signalCode = null;
     child.kill = function () { /* not yet supported */ };
 
-    rpcStream({ op: 'spawn', host: useHost, cmd: cmdString, cwd, shell }, (err, msg) => {
+    const remoteCmd = rewriteCommandFirstToken(cmdString);
+    rpcStream({ op: 'spawn', host: useHost, cmd: remoteCmd, cwd, shell }, (err, msg) => {
         if (err) {
             stdoutStream.destroy(err);
             stderrStream.destroy(err);
@@ -280,8 +374,9 @@ child_process.spawn = function (cmd, args, options) {
         return child;
     }
 
-    const useHost = meta.oneShotHost || activeHost;
+    let useHost = meta.oneShotHost || activeHost;
     const useCmd = meta.oneShotCmd || (args.length ? cmd + ' ' + args.join(' ') : cmd);
+    if (!meta.oneShotHost && shouldRunLocal(useCmd)) useHost = 'local';
 
     if (useHost === 'local') {
         if (VIRTUAL_PLATFORM_ENABLED) {
@@ -293,7 +388,14 @@ child_process.spawn = function (cmd, args, options) {
         return origSpawn.call(this, cmd, args, options);
     }
 
-    return makeRemoteChild(useCmd, options);
+    // Special-case shell-wrapped invocations. Claude Code's Bash tool uses
+    // /bin/zsh -c "SCRIPT". Route SCRIPT through MSYS bash directly so the
+    // agent doesn't wrap in cmd.exe (which can't parse bash syntax).
+    const sdc = detectShellDashC(cmd, args);
+    if (sdc) {
+        return makeRemoteChild(sdc.script, Object.assign({}, options, { __flowtoShell: sdc.shell, __flowtoHost: useHost }));
+    }
+    return makeRemoteChild(useCmd, Object.assign({}, options, { __flowtoHost: useHost }));
 };
 
 // ── Wrap child_process.exec ──────────────────────────────────
@@ -328,7 +430,8 @@ child_process.exec = function (command, options, callback) {
     let targetCwd = options.cwd || (hosts[useHost] && hosts[useHost].cwd) || '';
     targetCwd = translateForHost(targetCwd, useHost);
     const targetShell = (hosts[useHost] && hosts[useHost].shell) || process.env.DUMBTERM_REMOTE_SHELL || '';
-    rpcCall({ op: 'exec', host: useHost, cmd: useCmd, cwd: targetCwd, shell: targetShell }, (err, resp) => {
+    const remoteCmd = rewriteCommandFirstToken(useCmd);
+    rpcCall({ op: 'exec', host: useHost, cmd: remoteCmd, cwd: targetCwd, shell: targetShell }, (err, resp) => {
         if (err) { if (callback) callback(err, '', ''); return; }
         const out = Buffer.from(resp.out || '', 'base64').toString('utf8');
         const errStr = Buffer.from(resp.err || '', 'base64').toString('utf8');
@@ -363,6 +466,17 @@ const PATH_TRANSLATE_ENABLED   = cfgBool('DUMBTERM_PATH_TRANSLATE',   'pathTrans
 function isCloudPath(p) {
     return typeof p === 'string' && p.startsWith('/cloud/');
 }
+
+// Claude Code's Bash tool writes cwd-tracking sentinel files like
+// `/tmp/claude-XXXX-cwd` inside the bash script it spawns (via `pwd -P >|`),
+// then reads them back via fs.readFile to learn the post-command cwd. When
+// bash runs on a remote host, the file lives in that host's /tmp — reading
+// it from Mac's /tmp would ENOENT, and Claude treats that as an empty-output
+// failure. Route these reads to the host where the last remote spawn ran.
+function isClaudeSentinel(p) {
+    if (typeof p !== 'string') return false;
+    return /^\/tmp\/claude-[^\/]+/.test(p);
+}
 // Map /cloud/dumbterm/home/foo → CLOUD_BACKING + /foo (platform-translated)
 function translateCloudPath(p) {
     if (!p.startsWith(CLOUD_PREFIX)) return p;
@@ -377,6 +491,7 @@ function translateCloudPath(p) {
 // - Otherwise: VIRTUAL_FS=1 → active; else local
 function routeForPath(p) {
     if (isCloudPath(p)) return PERSISTENT_HOST;
+    if (isClaudeSentinel(p) && lastRemoteSpawnHost) return lastRemoteSpawnHost;
     if (PATH_TRANSLATE_ENABLED && pathMap.length) {
         for (const [local,] of pathMap) {
             if (typeof p === 'string' && p.startsWith(local)) return activeHost;

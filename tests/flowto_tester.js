@@ -681,6 +681,40 @@ test('context file reports active host', async () => {
     return 'active host = remote mentioned';
 });
 
+// ── Claude Code sentinel routing (cwd-tracking file /tmp/claude-*-cwd) ──
+// Claude Code's Bash tool writes /tmp/claude-XXXX-cwd inside a bash script on
+// the remote host, then reads it back via fs.readFile. Without the sentinel
+// route, that read goes to Mac's /tmp and ENOENTs — Claude then reports the
+// whole Bash invocation as "empty output". Verify the read routes back to the
+// host where the spawn ran.
+
+test('claude /tmp/claude-*-cwd sentinel: write-via-spawn then readback routes to remote', async () => {
+    const sentinel = '/tmp/claude-flowtotest-' + Date.now() + '-cwd';
+    // Mimic Claude's script: pwd -P >| /tmp/claude-XXXX-cwd
+    const cmdStr = `bash -c "pwd -P >| ${sentinel}; echo SPAWN_DONE"`;
+    // Use /bin/bash -c via the spawn(cmd, args) signature that detectShellDashC matches
+    const bashArgs = ['-c', `pwd -P >| ${sentinel}; echo SPAWN_DONE`];
+    await new Promise((resolve, reject) => {
+        const child = cp.spawn('/bin/bash', bashArgs);
+        let out = '';
+        child.stdout.on('data', d => out += d.toString());
+        child.on('exit', code => {
+            if (code !== 0) return reject(new Error(`spawn exit ${code}, out=${out}`));
+            if (!out.includes('SPAWN_DONE')) return reject(new Error(`no SPAWN_DONE, out=${out}`));
+            resolve();
+        });
+        child.on('error', reject);
+    });
+    // Now read the sentinel — this should route to the host where the spawn ran.
+    const contents = await new Promise((resolve, reject) => {
+        fs.readFile(sentinel, 'utf8', (err, data) => err ? reject(err) : resolve(data));
+    });
+    if (!contents || contents.length === 0) throw new Error('sentinel file empty');
+    // Cleanup (also via remote)
+    await new Promise((resolve) => fs.unlink(sentinel, () => resolve()));
+    return `sentinel readback: ${JSON.stringify(contents.trim())}`;
+});
+
 // ── Phase 14: spawn stdin (currently disabled; driver-side passthrough TBD) ──
 // Leaving agent-side stdin pipe in place for future work.
 
