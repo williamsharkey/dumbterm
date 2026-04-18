@@ -405,12 +405,16 @@ static void agent_spawn_streaming(sock_t s, int id, const char *cmd,
     }
     { char msg[128]; snprintf(msg, sizeof(msg), "{\"id\":%d,\"ok\":true,\"pid\":%u}", id, (unsigned)pi.dwProcessId);
       rpc_write_line(s, msg); }
-    /* non-blocking recv on socket for stdin messages. Poll loop. */
-    u_long nb = 1; ioctlsocket(s, FIONBIO, &nb);
-    static RpcConn sconn_s; static int sconn_inited = 0;
-    if (!sconn_inited || sconn_s.s != s) { rpc_conn_init(&sconn_s, s); sconn_inited = 1; }
+    /* We intentionally do NOT read from the main client socket here. Earlier
+       versions did (to receive spawn_stdin messages) and used a *static*
+       RpcConn buffer. But reads during a spawn also greedily consumed
+       unrelated requests (e.g. a second concurrent spawn) and silently
+       dropped them — the client would wait forever for a response that
+       never came. Until we implement a proper out-of-band stdin channel,
+       stdin is stubbed and we just stream stdout/stderr + wait for exit. */
     unsigned char buf[4096];
-    int stdin_closed = 0;
+    int stdin_closed = 1;
+    CloseHandle(in_wr); in_wr = NULL;
     for (;;) {
         DWORD avail = 0;
         if (PeekNamedPipe(out_rd, NULL, 0, NULL, &avail, NULL) && avail > 0) {
@@ -420,24 +424,6 @@ static void agent_spawn_streaming(sock_t s, int id, const char *cmd,
         if (PeekNamedPipe(err_rd, NULL, 0, NULL, &avail, NULL) && avail > 0) {
             DWORD n = 0; if (ReadFile(err_rd, buf, avail < sizeof(buf) ? avail : sizeof(buf), &n, NULL) && n > 0)
                 agent_stream(s, id, "err", buf, (int)n);
-        }
-        /* Check socket for stdin messages (non-blocking) */
-        int rlen = 0; char *rline = rpc_read_line(&sconn_s, &rlen);
-        if (rline && rlen > 0) {
-            char *op2 = json_str(rline, "op");
-            if (op2 && strcmp(op2, "spawn_stdin") == 0 && !stdin_closed) {
-                char *data = json_str(rline, "data");
-                if (data) {
-                    int dlen = 0; unsigned char *bytes = b64_decode(data, &dlen);
-                    if (bytes && dlen > 0) {
-                        DWORD wn = 0; WriteFile(in_wr, bytes, dlen, &wn, NULL);
-                    }
-                    free(bytes); free(data);
-                }
-            } else if (op2 && strcmp(op2, "spawn_stdin_close") == 0) {
-                CloseHandle(in_wr); stdin_closed = 1; in_wr = NULL;
-            }
-            free(op2);
         }
         DWORD wr = WaitForSingleObject(pi.hProcess, 30);
         if (wr == WAIT_OBJECT_0) {
@@ -455,10 +441,8 @@ static void agent_spawn_streaming(sock_t s, int id, const char *cmd,
         }
     }
     DWORD ec = 0; GetExitCodeProcess(pi.hProcess, &ec);
-    if (!stdin_closed && in_wr) CloseHandle(in_wr);
     CloseHandle(out_rd); CloseHandle(err_rd); CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
-    /* Restore blocking mode so subsequent rpc reads work normally */
-    nb = 0; ioctlsocket(s, FIONBIO, &nb);
+    (void)stdin_closed;
     char msg[128]; snprintf(msg, sizeof(msg), "{\"id\":%d,\"exit\":%d}", id, (int)ec);
     rpc_write_line(s, msg);
 #else

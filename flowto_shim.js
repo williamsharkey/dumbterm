@@ -15,6 +15,23 @@ const realPlatform = process.platform; // capture before we override below
 const gw = process.env.DUMBTERM_GATEWAY;
 if (!gw) { return; /* not running under --flowto; stay inert */ }
 
+// Optional trace log: every intercepted fs/child_process call + host routing
+// decision. Set DUMBTERM_FLOWTO_TRACE=<path> (e.g. /tmp/flowto-trace.log).
+const _traceFile = process.env.DUMBTERM_FLOWTO_TRACE;
+let _traceStream = null;
+if (_traceFile) {
+    try { _traceStream = require('fs').createWriteStream(_traceFile, { flags: 'a' }); } catch (e) {}
+}
+function TRACE(tag, data) {
+    if (!_traceStream) return;
+    try {
+        const s = typeof data === 'string' ? data :
+            JSON.stringify(data, (k, v) => typeof v === 'string' && v.length > 200 ? v.slice(0, 200) + '…' : v);
+        _traceStream.write(`[${Date.now()}] ${tag} ${s}\n`);
+    } catch (e) {}
+}
+TRACE('BOOT', { gw, argv: process.argv.slice(0, 5), pid: process.pid });
+
 const [gwHost, gwPortStr] = gw.split(':');
 const gwPort = parseInt(gwPortStr);
 
@@ -150,6 +167,22 @@ function rewriteCommandFirstToken(cmd) {
     return cmd;
 }
 
+// Rewrite a shell invocation string (e.g. ".flowto.json remoteShell"). The
+// shell string may be "/usr/bin/bash" or "/usr/bin/bash -c" — map the first
+// token via COMMAND_MAP so CreateProcessA on W7 gets a native Windows path.
+// Appends " -c" if the original had no trailing args (shells always need it).
+function rewriteShellPath(shell) {
+    if (typeof shell !== 'string' || !shell) return shell;
+    const m = shell.match(/^(\S+)(\s[\s\S]*)?$/);
+    if (!m) return shell;
+    const first = m[1];
+    const rest = m[2] || '';
+    if (!COMMAND_MAP[first]) return shell;
+    const mapped = '"' + COMMAND_MAP[first] + '"';
+    // If no "-c" (or any arg), append " -c" so the shell accepts a script arg.
+    return rest ? mapped + rest : mapped + ' -c';
+}
+
 // Detect the "shell -c SCRIPT" invocation pattern used by Claude Code's Bash
 // tool. When found, rewrite so the agent invokes the mapped bash DIRECTLY
 // (bypassing the outer cmd.exe wrap). Otherwise cmd.exe chokes on bash-isms
@@ -188,9 +221,22 @@ let _pending = new Map(); // id → callback(err, response)
 let _conn = null;
 let _connBuf = '';
 
+// Keep the socket referenced (blocking event-loop exit) only while there are
+// outstanding RPCs. When _pending drains, unref so Node can exit cleanly.
+function updateConnRef() {
+    if (!_conn) return;
+    if (_pending.size > 0) _conn.ref();
+    else _conn.unref();
+}
+
 function connectGateway(cb) {
     if (_conn) return cb(null);
     _conn = net.createConnection(gwPort, gwHost, () => cb(null));
+    // Start unref'd so we don't keep the event loop alive when idle.
+    // updateConnRef() re-refs whenever there are pending RPCs and unrefs
+    // again once all replies are in — otherwise apps that exit implicitly
+    // (like `claude --print` which lets the loop drain) hang forever.
+    _conn.unref();
     _conn.on('data', (chunk) => {
         _connBuf += chunk.toString('utf8');
         let nl;
@@ -205,7 +251,7 @@ function connectGateway(cb) {
                     // For streaming ops (spawn), handler is rpcStream's wrapper
                     // which keeps itself registered until it sees an exit msg.
                     if (p._streaming) p(null, msg);
-                    else { _pending.delete(msg.id); p(null, msg); }
+                    else { _pending.delete(msg.id); p(null, msg); updateConnRef(); }
                 }
             } catch (e) { /* ignore */ }
         }
@@ -219,6 +265,7 @@ function rpcCall(req, cb) {
         if (err) return cb(err);
         req.id = _nextId++;
         _pending.set(req.id, cb);
+        updateConnRef();
         _conn.write(JSON.stringify(req) + '\n');
     });
 }
@@ -231,12 +278,13 @@ function rpcStream(req, onMsg) {
         if (err) { onMsg(err, null); return; }
         req.id = _nextId++;
         const handler = (err, msg) => {
-            if (err) { _pending.delete(req.id); onMsg(err, null); return; }
+            if (err) { _pending.delete(req.id); updateConnRef(); onMsg(err, null); return; }
             onMsg(null, msg);
-            if (msg && 'exit' in msg) _pending.delete(req.id);
+            if (msg && 'exit' in msg) { _pending.delete(req.id); updateConnRef(); }
         };
         handler._streaming = true;
         _pending.set(req.id, handler);
+        updateConnRef();
         _conn.write(JSON.stringify(req) + '\n');
     });
 }
@@ -289,10 +337,14 @@ function makeRemoteChild(cmdString, options) {
     lastRemoteSpawnHost = useHost;
     let cwd = options.cwd || (hosts[useHost] && hosts[useHost].cwd) || '';
     cwd = translateForHost(cwd, useHost);
-    const shell = options.__flowtoShell
+    const rawShell = options.__flowtoShell
         || (hosts[useHost] && hosts[useHost].shell)
         || process.env.DUMBTERM_REMOTE_SHELL
         || '';
+    // Map POSIX shell paths (/usr/bin/bash, /bin/sh) to native Windows ones.
+    // CreateProcessA on W7 can't resolve /usr/bin/*. __flowtoShell comes in
+    // pre-quoted and can be used as-is; raw shell strings need rewriting.
+    const shell = options.__flowtoShell ? rawShell : rewriteShellPath(rawShell);
     const child = new EventEmitter();
     const stdoutStream = new Readable({ read() {} });
     const stderrStream = new Readable({ read() {} });
@@ -355,6 +407,7 @@ child_process.spawn = function (cmd, args, options) {
     if (Array.isArray(args)) { options = options || {}; }
     else if (typeof args === 'object' && args !== null) { options = args; args = []; }
     else { args = []; options = options || {}; }
+    TRACE('SPAWN', { cmd, args: Array.isArray(args) ? args.slice(0, 8) : args });
 
     const meta = maybeMetaCommand(cmd);
     if (meta.handled) {
@@ -403,6 +456,7 @@ const origExec = child_process.exec;
 child_process.exec = function (command, options, callback) {
     if (typeof options === 'function') { callback = options; options = {}; }
     options = options || {};
+    TRACE('EXEC', { command: String(command).slice(0, 200) });
 
     const meta = maybeMetaCommand(command);
     if (meta.handled) {
@@ -461,7 +515,11 @@ const VIRTUAL_PLATFORM_ENABLED = cfgBool('DUMBTERM_VIRTUAL_PLATFORM', 'virtualPl
 const VIRTUAL_PATH_ENABLED     = cfgBool('DUMBTERM_VIRTUAL_PATH',     'virtualPath');
 const VIRTUAL_ENV_ENABLED      = cfgBool('DUMBTERM_VIRTUAL_ENV',      'virtualEnv');
 const VIRTUAL_FS_ENABLED       = cfgBool('DUMBTERM_VIRTUAL_FS',       'virtualFs');
-const PATH_TRANSLATE_ENABLED   = cfgBool('DUMBTERM_PATH_TRANSLATE',   'pathTranslate') || pathMap.length > 0;
+// Aggressive mode: route EVERY unmapped path to the active remote host.
+// Only useful for the test suite; Claude Code and most real apps break
+// under this because they read their own config files under $HOME.
+const VIRTUAL_FS_AGGRESSIVE    = process.env.DUMBTERM_VIRTUAL_FS_AGGRESSIVE === '1' || !!projectCfg.virtualFsAggressive;
+const PATH_TRANSLATE_ENABLED   = cfgBool('DUMBTERM_PATH_TRANSLATE',   'pathTranslate') || pathMap.length > 0 || VIRTUAL_FS_ENABLED;
 
 function isCloudPath(p) {
     return typeof p === 'string' && p.startsWith('/cloud/');
@@ -487,31 +545,64 @@ function translateCloudPath(p) {
 
 // Which host should a path go to?
 // - /cloud/... always persists to PERSISTENT_HOST
+// - /tmp/claude-* sentinel files route to the host of the last remote spawn
 // - Paths matching pathMap's local prefixes route to the remote (active host)
-// - Otherwise: VIRTUAL_FS=1 → active; else local
+// - Otherwise: LOCAL.
+//
+// Note: `virtualFs: true` used to mean "route every unmapped path to remote",
+// but that was too aggressive — Claude Code (and any other app) reads its own
+// config files under $HOME, and those obviously don't exist on the remote.
+// The active-host fallback is now gated behind VIRTUAL_FS_AGGRESSIVE (env-only,
+// no .flowto.json knob) for the rare case where you really want it.
 function routeForPath(p) {
     if (isCloudPath(p)) return PERSISTENT_HOST;
     if (isClaudeSentinel(p) && lastRemoteSpawnHost) return lastRemoteSpawnHost;
-    if (PATH_TRANSLATE_ENABLED && pathMap.length) {
-        for (const [local,] of pathMap) {
-            if (typeof p === 'string' && p.startsWith(local)) return activeHost;
+    if (PATH_TRANSLATE_ENABLED && pathMap.length && typeof p === 'string') {
+        for (const [local, remote] of pathMap) {
+            // Either side of the map means "this belongs to the remote host":
+            // Mac paths to be translated on the way out, or already-remote
+            // paths returned to us (e.g. via virtualCwd).
+            if (p.startsWith(local) || p.startsWith(remote)) return activeHost;
         }
     }
-    if (!VIRTUAL_FS_ENABLED) return 'local';
-    return activeHost;
+    if (VIRTUAL_FS_AGGRESSIVE) return activeHost;
+    return 'local';
+}
+
+// Convert an MSYS-style Windows path (e.g. /c/workspace/lot) to native
+// Windows form (C:\workspace\lot). No-op for paths that don't match the
+// /<letter>/ prefix or for non-Windows targets.
+function msysToWin(p) {
+    if (typeof p !== 'string') return p;
+    const m = p.match(/^\/([a-zA-Z])(\/.*|$)/);
+    if (!m) return p;
+    const drive = m[1].toUpperCase();
+    const rest = (m[2] || '').replace(/\//g, '\\');
+    return drive + ':' + (rest || '\\');
 }
 
 // Translate a path from driver (Mac) convention to active host convention.
-// Prefix substitution via pathMap. No-op if no mapping matches.
+// Prefix substitution via pathMap, then MSYS→Win conversion on Windows hosts
+// (because the agent uses native Win32 opendir/stat which doesn't understand
+// /c/...). No-op if no mapping matches.
 function translateForHost(p, hostName) {
     if (typeof p !== 'string') return p;
     if (isCloudPath(p)) return translateCloudPath(p);
-    if (!PATH_TRANSLATE_ENABLED || !pathMap.length) return p;
     if (hostName === 'local') return p;
-    for (const [local, remote] of pathMap) {
-        if (p.startsWith(local)) return remote + p.slice(local.length);
+    let out = p;
+    if (PATH_TRANSLATE_ENABLED && pathMap.length) {
+        for (const [local, remote] of pathMap) {
+            if (p.startsWith(local)) { out = remote + p.slice(local.length); break; }
+        }
     }
-    return p;
+    // Always apply MSYS→Win conversion for non-local hosts. Paths that don't
+    // match /<letter>/ are left untouched. We don't gate on h.platform here
+    // because fs ops fire early (before host_info lands), so the platform
+    // would still be null — defaulting to "try win32" is safe since non-MSYS
+    // paths are a no-op.
+    const h = hosts[hostName];
+    if (!h || h.platform !== 'linux') out = msysToWin(out);
+    return out;
 }
 
 // ── Override HOME / os.homedir (opt-in) ──────────────────────
@@ -544,6 +635,7 @@ const origReadFile = fs.readFile;
 fs.readFile = function (path, opts, cb) {
     if (typeof opts === 'function') { cb = opts; opts = undefined; }
     const host = routeForPath(path);
+    TRACE('READFILE', { path, host });
     if (host === 'local') {
         return origReadFile.call(this, path, opts, cb);
     }
@@ -566,6 +658,7 @@ const origWriteFile = fs.writeFile;
 fs.writeFile = function (path, data, opts, cb) {
     if (typeof opts === 'function') { cb = opts; opts = undefined; }
     const host = routeForPath(path);
+    TRACE('WRITEFILE', { path, host });
     if (host === 'local') {
         return origWriteFile.call(this, path, data, opts, cb);
     }
@@ -587,6 +680,7 @@ const origReaddir = fs.readdir;
 fs.readdir = function (path, opts, cb) {
     if (typeof opts === 'function') { cb = opts; opts = undefined; }
     const host = routeForPath(path);
+    TRACE('READDIR', { path, host });
     if (host === 'local') return origReaddir.call(this, path, opts, cb);
     const remotePath = translateForHost(path, host);
     rpcCall({ op: 'readdir', host, path: remotePath }, (err, resp) => {
@@ -604,6 +698,7 @@ const origStat = fs.stat;
 fs.stat = function (path, opts, cb) {
     if (typeof opts === 'function') { cb = opts; opts = undefined; }
     const host = routeForPath(path);
+    TRACE('STAT', { path, host });
     if (host === 'local') return origStat.call(this, path, opts, cb);
     const remotePath = translateForHost(path, host);
     rpcCall({ op: 'stat', host, path: remotePath }, (err, resp) => {
