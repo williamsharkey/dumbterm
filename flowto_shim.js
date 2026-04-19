@@ -760,17 +760,91 @@ function syscallError(code, p, syscall) {
     const e = new Error(code + ': ' + (syscall || 'op')); e.code = code; e.path = p; e.syscall = syscall || 'op'; return e;
 }
 
+// ── Virtual fd table for remote file reads ──────────────────
+// Claude's iC() helper (used by Write/Edit) does:
+//     openSync(path, 'r') → readSync(fd, buf, ...) → closeSync(fd)
+// to detect BOM/encoding on the first 4KB. Without openSync wrapping,
+// Node's native openSync hits Mac's local fs and throws ENOENT; Edit
+// then thinks the file is empty and fails with "String not found".
+// We maintain a small virtual-fd table: open routes via RPC-read, stash
+// the bytes; read/close operate on that cached buffer.
+const _virtualFds = new Map();  // fd (number) → { path, host, buf, pos }
+let _nextVirtualFd = 1000000;   // avoid collision with real fds
+
+const origOpenSync = fs.openSync;
+fs.openSync = function (path, flags, mode) {
+    const host = routeForPathSync(path);
+    TRACE('OPENSYNC', { path, host, flags });
+    if (host === 'local') return origOpenSync.apply(this, arguments);
+    // Only support read modes for remote (O_RDONLY or 'r').
+    const isRead = flags === undefined || flags === 0 || flags === 'r' || flags === fs.constants.O_RDONLY;
+    if (!isRead) {
+        TRACE('OPENSYNC_WRITE_UNSUPPORTED', { path, flags });
+        throw syscallError('EPERM', path, 'open');
+    }
+    const remotePath = translateForHost(path, host);
+    const resp = rpcSync({ op: 'read', host, path: remotePath });
+    if (!resp.ok) throw enoentFor(path);
+    const buf = Buffer.from(resp.data || '', 'base64');
+    const fd = _nextVirtualFd++;
+    _virtualFds.set(fd, { path, host, buf, pos: 0 });
+    return fd;
+};
+
+const origReadSync = fs.readSync;
+fs.readSync = function (fd, buffer, offset, length, position) {
+    const v = _virtualFds.get(fd);
+    if (!v) return origReadSync.apply(this, arguments);
+    const pos = position == null ? v.pos : position;
+    const avail = Math.max(0, v.buf.length - pos);
+    const n = Math.min(length, avail);
+    v.buf.copy(buffer, offset, pos, pos + n);
+    if (position == null) v.pos = pos + n;
+    return n;
+};
+
+const origCloseSync = fs.closeSync;
+fs.closeSync = function (fd) {
+    if (_virtualFds.has(fd)) { _virtualFds.delete(fd); return undefined; }
+    return origCloseSync.apply(this, arguments);
+};
+
+// lstatSync — Claude's vA() helper calls lstatSync to detect symlinks
+// before iC() opens the file. Route to remote same as statSync (we don't
+// follow symlinks on the remote end either — good enough for Claude's
+// check, which just wants to know if the path is a regular file).
+const origLstatSync = fs.lstatSync;
+fs.lstatSync = function (path, opts) {
+    const host = routeForPathSync(path);
+    TRACE('LSTATSYNC', { path, host });
+    if (host === 'local') return origLstatSync.apply(this, arguments);
+    return fs.statSync(path, opts);
+};
+
+// realpathSync — Claude's vA() calls this to resolve symlinks. Our agent
+// doesn't resolve symlinks; just return the mapped path as "canonical".
+const origRealpathSync = fs.realpathSync;
+fs.realpathSync = function (path, opts) {
+    const host = routeForPathSync(path);
+    TRACE('REALPATHSYNC', { path, host });
+    if (host === 'local') return origRealpathSync.apply(this, arguments);
+    // No symlink resolution on remote — return path as-is. Claude's vA
+    // wraps this in try/catch so "can't resolve" is fine.
+    return path;
+};
+
 // readFileSync — Claude's Write tool reads the existing file via iC() to
 // detect changes. Must route through pathMap to W7, not Mac's local fs.
 const origReadFileSync = fs.readFileSync;
 fs.readFileSync = function (path, opts) {
     const host = routeForPathSync(path);
-    TRACE('READFILESYNC', { path, host });
+    TRACE('READFILESYNC', { path, host, opts: opts && typeof opts === 'object' ? opts.encoding : opts });
     if (host === 'local') return origReadFileSync.call(this, path, opts);
     const remotePath = translateForHost(path, host);
     const resp = rpcSync({ op: 'read', host, path: remotePath });
     if (!resp.ok) throw enoentFor(path);
     const buf = Buffer.from(resp.data || '', 'base64');
+    TRACE('READFILESYNC_DATA', { path, len: buf.length, preview: buf.slice(0, 80).toString('utf8') });
     if (opts === 'utf8' || (opts && opts.encoding === 'utf8')) return buf.toString('utf8');
     if (typeof opts === 'string') return buf.toString(opts);
     if (opts && opts.encoding) return buf.toString(opts.encoding);
@@ -810,10 +884,13 @@ fs.statSync = function (path, opts) {
 const origWriteFileSync = fs.writeFileSync;
 fs.writeFileSync = function (path, data, opts) {
     const host = routeForPathSync(path);
-    TRACE('WRITEFILESYNC', { path, host, len: data && data.length });
-    if (host === 'local') return origWriteFileSync.call(this, path, data, opts);
+    if (host === 'local') {
+        TRACE('WRITEFILESYNC', { path, host, len: data && data.length });
+        return origWriteFileSync.call(this, path, data, opts);
+    }
     const remotePath = translateForHost(path, host);
     const buf = Buffer.isBuffer(data) ? data : Buffer.from(String(data), (opts && opts.encoding) || 'utf8');
+    TRACE('WRITEFILESYNC', { path, host, len: buf.length, preview: buf.slice(0, 80).toString('utf8') });
     const resp = rpcSync({ op: 'write', host, path: remotePath, data: buf.toString('base64') });
     if (!resp.ok) throw syscallError(resp.errno || 'EIO', path, 'write');
     return undefined;
@@ -874,7 +951,7 @@ const origReadFile = fs.readFile;
 fs.readFile = function (path, opts, cb) {
     if (typeof opts === 'function') { cb = opts; opts = undefined; }
     const host = routeForPath(path);
-    TRACE('READFILE', { path, host });
+    TRACE('READFILE', { path, host, opts: opts && typeof opts === 'object' ? opts.encoding : opts });
     if (host === 'local') {
         return origReadFile.call(this, path, opts, cb);
     }
@@ -887,6 +964,7 @@ fs.readFile = function (path, opts, cb) {
             return cb && cb(e);
         }
         const buf = Buffer.from(resp.data || '', 'base64');
+        TRACE('READFILE_DATA', { path, len: buf.length, preview: buf.slice(0, 64).toString('utf8') });
         if (opts && (opts === 'utf8' || opts.encoding === 'utf8')) return cb && cb(null, buf.toString('utf8'));
         cb && cb(null, buf);
     });
@@ -986,16 +1064,56 @@ fs.rename = function (from, to, cb) {
     });
 };
 
+// unlinkSync — Claude's Uf6 unlinks orphaned .tmp files on failure, and
+// its Edit fallback path explicitly unlinks before rewriting. Without this
+// wrapper the unlink hits local Mac fs, always ENOENTs, and the orphan
+// lingers on W7.
+const origUnlinkSync = fs.unlinkSync;
+fs.unlinkSync = function (path) {
+    const host = routeForPathSync(path);
+    TRACE('UNLINKSYNC', { path, host });
+    if (host === 'local') return origUnlinkSync.apply(this, arguments);
+    const remotePath = translateForHost(path, host);
+    const resp = rpcSync({ op: 'unlink', host, path: remotePath });
+    if (!resp.ok) throw syscallError(resp.errno || 'EIO', path, 'unlink');
+    return undefined;
+};
+
+// chmodSync / fchmodSync — Claude's Uf6 applies the original file's mode
+// to the new tmp (Wd5() call) before renaming. The agent doesn't track
+// POSIX modes and the W7 filesystem doesn't use them meaningfully, so we
+// silently succeed. Without this the chmodSync throws → Uf6's atomic
+// rename path is skipped → non-atomic fallback writes directly to target
+// and leaves the orphan .tmp.
+const origChmodSync = fs.chmodSync;
+fs.chmodSync = function (path, mode) {
+    const host = routeForPathSync(path);
+    TRACE('CHMODSYNC', { path, host, mode });
+    if (host === 'local') return origChmodSync.apply(this, arguments);
+    return undefined;  // no-op on remote
+};
+if (fs.fchmodSync) {
+    const origFchmodSync = fs.fchmodSync;
+    fs.fchmodSync = function (fd, mode) {
+        if (_virtualFds.has(fd)) return undefined;
+        return origFchmodSync.apply(this, arguments);
+    };
+}
+
 const origRenameSync = fs.renameSync;
 fs.renameSync = function (from, to) {
     const hostFrom = routeForPathSync(from);
     const hostTo = routeForPathSync(to);
+    TRACE('RENAMESYNC', { from, to, hostFrom, hostTo });
     if (hostFrom === 'local' && hostTo === 'local') return origRenameSync.call(this, from, to);
     if (hostFrom !== hostTo) throw syscallError('EXDEV', from, 'rename');
     const rFrom = translateForHost(from, hostFrom);
     const rTo   = translateForHost(to, hostTo);
     const resp = rpcSync({ op: 'rename', host: hostFrom, from: rFrom, to: rTo });
-    if (!resp.ok) throw syscallError(resp.errno || 'EIO', from, 'rename');
+    if (!resp.ok) {
+        TRACE('RENAMESYNC_FAIL', { from, to, rFrom, rTo, resp });
+        throw syscallError(resp.errno || 'EIO', from, 'rename');
+    }
     return undefined;
 };
 
