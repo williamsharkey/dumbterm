@@ -757,7 +757,26 @@ static void agent_handle_request(sock_t s, const char *req) {
     } else if (strcmp(op, "rename") == 0) {
         char *from = json_str(req, "from");
         char *to   = json_str(req, "to");
-        int rc = (from && to) ? rename(from, to) : -1;
+        int rc = -1;
+        if (from && to) {
+#ifdef _WIN32
+            /* POSIX rename(2) on Windows fails when target exists
+               (non-atomic replace). Claude's atomic-write pattern
+               writes foo.tmp then renames to foo — target usually
+               exists. Use MoveFileExA with REPLACE_EXISTING +
+               WRITE_THROUGH for atomic-ish replace. */
+            if (MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+                rc = 0;
+            } else {
+                DWORD w = GetLastError();
+                errno = (w == ERROR_FILE_NOT_FOUND || w == ERROR_PATH_NOT_FOUND) ? ENOENT :
+                        (w == ERROR_ACCESS_DENIED) ? EACCES :
+                        (w == ERROR_ALREADY_EXISTS) ? EEXIST : EIO;
+            }
+#else
+            rc = rename(from, to);
+#endif
+        }
         const char *ecode = "EIO";
         if (errno == ENOENT) ecode = "ENOENT";
         else if (errno == EEXIST) ecode = "EEXIST";

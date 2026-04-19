@@ -792,15 +792,34 @@ fs.openSync = function (path, flags, mode) {
 };
 
 const origReadSync = fs.readSync;
-fs.readSync = function (fd, buffer, offset, length, position) {
+fs.readSync = function (fd, buffer, offsetOrOpts, length, position) {
     const v = _virtualFds.get(fd);
     if (!v) return origReadSync.apply(this, arguments);
-    const pos = position == null ? v.pos : position;
+    // Two signatures:
+    //   readSync(fd, buffer, offset, length, position)        — 5-arg
+    //   readSync(fd, {buffer?, offset?, length?, position?})  — 2-arg, returns {buffer,bytesRead}
+    // Claude Code's aU6 encoding detector uses the 2-arg form.
+    const isOptsForm = (buffer !== null && typeof buffer === 'object'
+                        && !Buffer.isBuffer(buffer) && !(buffer instanceof Uint8Array));
+    let target, offset, len, pos;
+    if (isOptsForm) {
+        const opts = buffer;
+        len = opts.length != null ? opts.length : (opts.buffer ? opts.buffer.length : 16384);
+        offset = opts.offset || 0;
+        pos = opts.position != null ? opts.position : v.pos;
+        target = opts.buffer || Buffer.alloc(len);
+    } else {
+        target = buffer;
+        offset = offsetOrOpts || 0;
+        len = length;
+        pos = position != null ? position : v.pos;
+    }
     const avail = Math.max(0, v.buf.length - pos);
-    const n = Math.min(length, avail);
-    v.buf.copy(buffer, offset, pos, pos + n);
-    if (position == null) v.pos = pos + n;
-    return n;
+    const n = Math.min(len || 0, avail);
+    if (n > 0) v.buf.copy(target, offset, pos, pos + n);
+    const posWasExplicit = isOptsForm ? (buffer.position != null) : (position != null);
+    if (!posWasExplicit) v.pos = pos + n;
+    return isOptsForm ? { buffer: target, bytesRead: n } : n;
 };
 
 const origCloseSync = fs.closeSync;
