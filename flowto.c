@@ -761,10 +761,18 @@ static void agent_handle_request(sock_t s, const char *req) {
 #else
         int rc = path ? mkdir(path, 0755) : -1;
 #endif
+        /* Map errno → symbolic name. Callers (e.g. Claude Code) check
+           err.code === 'EEXIST' — strerror() returns English messages
+           ("File exists") that don't match symbolic codes. */
+        const char *ecode = "EIO";
+        if (errno == EEXIST) ecode = "EEXIST";
+        else if (errno == ENOENT) ecode = "ENOENT";
+        else if (errno == EACCES) ecode = "EACCES";
+        else if (errno == ENOTDIR) ecode = "ENOTDIR";
+        else if (errno == EPERM) ecode = "EPERM";
         char msg[256];
         if (rc == 0) snprintf(msg, sizeof(msg), "{\"id\":%d,\"ok\":true}", id);
-        else snprintf(msg, sizeof(msg), "{\"id\":%d,\"ok\":false,\"errno\":\"%s\"}",
-                      id, strerror(errno));
+        else snprintf(msg, sizeof(msg), "{\"id\":%d,\"ok\":false,\"errno\":\"%s\"}", id, ecode);
         rpc_write_line(s, msg);
         free(path);
     } else {
@@ -798,23 +806,61 @@ static int flowto_run_agent(const char *addr) {
     sa.sin_family = AF_INET; sa.sin_port = htons(port);
     sa.sin_addr.s_addr = inet_addr(host);
     if (bind(srv, (struct sockaddr*)&sa, sizeof(sa)) < 0) { perror("agent bind"); return 1; }
-    listen(srv, 1);
+    listen(srv, 8);
     fprintf(stderr, "flowto agent: listening on %s:%d\n", host, port);
+    /* Multi-client select loop so stale connections don't block new ones.
+       Each active client is serviced serially: we read one request, handle
+       it, then move on. Requests are independent (stat/read/write) or
+       self-contained streaming (spawn — but we single-thread through
+       those, so parallel spawns from different clients will serialize). */
+    #define FLOWTO_AGENT_MAX_CLIENTS 16
+    sock_t cls[FLOWTO_AGENT_MAX_CLIENTS];
+    RpcConn *cns[FLOWTO_AGENT_MAX_CLIENTS];
+    int ncls = 0;
+    for (int i = 0; i < FLOWTO_AGENT_MAX_CLIENTS; i++) { cls[i] = SOCK_INVALID; cns[i] = NULL; }
     for (;;) {
-        struct sockaddr_in ca; int calen = sizeof(ca);
-        sock_t c = accept(srv, (struct sockaddr*)&ca, (void*)&calen);
-        if (c == SOCK_INVALID) continue;
-        fprintf(stderr, "flowto agent: client connected\n");
-        RpcConn conn; rpc_conn_init(&conn, c);
-        for (;;) {
-            int n = 0;
-            char *req = rpc_read_line(&conn, &n);
-            if (!req || n <= 0) break;
-            agent_handle_request(c, req);
+        fd_set rfds; FD_ZERO(&rfds);
+        int maxfd = (int)srv; FD_SET(srv, &rfds);
+        for (int i = 0; i < ncls; i++) {
+            if (cls[i] != SOCK_INVALID) {
+                FD_SET(cls[i], &rfds);
+                if ((int)cls[i] > maxfd) maxfd = (int)cls[i];
+            }
         }
-        rpc_conn_free(&conn);
-        sock_close(c);
-        fprintf(stderr, "flowto agent: client disconnected\n");
+        int ready = select(maxfd + 1, &rfds, NULL, NULL, NULL);
+        if (ready < 0) continue;
+        if (FD_ISSET(srv, &rfds)) {
+            struct sockaddr_in ca; int calen = sizeof(ca);
+            sock_t c = accept(srv, (struct sockaddr*)&ca, (void*)&calen);
+            if (c != SOCK_INVALID) {
+                int slot = -1;
+                for (int i = 0; i < FLOWTO_AGENT_MAX_CLIENTS; i++)
+                    if (cls[i] == SOCK_INVALID) { slot = i; break; }
+                if (slot >= 0) {
+                    cls[slot] = c;
+                    cns[slot] = (RpcConn*)malloc(sizeof(RpcConn));
+                    rpc_conn_init(cns[slot], c);
+                    if (slot >= ncls) ncls = slot + 1;
+                    fprintf(stderr, "flowto agent: client connected (slot %d)\n", slot);
+                } else {
+                    fprintf(stderr, "flowto agent: max clients reached, rejecting\n");
+                    sock_close(c);
+                }
+            }
+        }
+        for (int i = 0; i < ncls; i++) {
+            if (cls[i] == SOCK_INVALID || !FD_ISSET(cls[i], &rfds)) continue;
+            int n = 0;
+            char *req = rpc_read_line(cns[i], &n);
+            if (!req || n <= 0) {
+                rpc_conn_free(cns[i]); free(cns[i]); cns[i] = NULL;
+                sock_close(cls[i]); cls[i] = SOCK_INVALID;
+                fprintf(stderr, "flowto agent: client disconnected (slot %d)\n", i);
+                continue;
+            }
+            agent_handle_request(cls[i], req);
+        }
+        while (ncls > 0 && cls[ncls - 1] == SOCK_INVALID) ncls--;
     }
 }
 
@@ -908,22 +954,81 @@ static void flowto_dispatch(sock_t shim, const char *req) {
     free(host);
 }
 
-/* Run the shim gateway loop: accept one client, serve requests forever.
-   gateway_port is the bound TCP port. Returns when shim disconnects. */
+/* Run the shim gateway loop: accept multiple clients (main shim + sync
+   helpers spawned by child Node processes for blocking RPC), serve each
+   one's requests on a shared agent connection. We serialize requests
+   across clients — each client's request is forwarded to the agent and
+   its response returned to THAT client before we read the next request.
+   Since RPCs are sub-ms typical, this is fine for our workload. Returns
+   when all clients have disconnected and no more are arriving. */
+#define FLOWTO_GW_MAX_CLIENTS 16
 static void flowto_run_gateway(sock_t gateway) {
-    struct sockaddr_in ca; int calen = sizeof(ca);
-    sock_t shim = accept(gateway, (struct sockaddr*)&ca, (void*)&calen);
-    if (shim == SOCK_INVALID) return;
-    fprintf(stderr, "flowto: shim connected\n");
-    RpcConn conn; rpc_conn_init(&conn, shim);
+    sock_t clients[FLOWTO_GW_MAX_CLIENTS];
+    RpcConn *conns[FLOWTO_GW_MAX_CLIENTS];
+    int n_clients = 0;
+    for (int i = 0; i < FLOWTO_GW_MAX_CLIENTS; i++) { clients[i] = SOCK_INVALID; conns[i] = NULL; }
+    int first_connected = 0;
     for (;;) {
-        int n = 0;
-        char *req = rpc_read_line(&conn, &n);
-        if (!req || n <= 0) break;
-        flowto_dispatch(shim, req);
+        fd_set rfds; FD_ZERO(&rfds);
+        int maxfd = (int)gateway; FD_SET(gateway, &rfds);
+        for (int i = 0; i < n_clients; i++) {
+            if (clients[i] != SOCK_INVALID) {
+                FD_SET(clients[i], &rfds);
+                if ((int)clients[i] > maxfd) maxfd = (int)clients[i];
+            }
+        }
+        struct timeval tv = { first_connected ? 5 : 60, 0 };
+        int ready = select(maxfd + 1, &rfds, NULL, NULL, &tv);
+        if (ready < 0) break;
+        if (ready == 0) {
+            /* Idle tick: if we had clients but all left, exit. */
+            if (first_connected && n_clients == 0) break;
+            continue;
+        }
+        /* New client */
+        if (FD_ISSET(gateway, &rfds) && n_clients < FLOWTO_GW_MAX_CLIENTS) {
+            struct sockaddr_in ca; int calen = sizeof(ca);
+            sock_t s = accept(gateway, (struct sockaddr*)&ca, (void*)&calen);
+            if (s != SOCK_INVALID) {
+                int slot = -1;
+                for (int i = 0; i < FLOWTO_GW_MAX_CLIENTS; i++)
+                    if (clients[i] == SOCK_INVALID) { slot = i; break; }
+                if (slot >= 0) {
+                    clients[slot] = s;
+                    conns[slot] = (RpcConn*)malloc(sizeof(RpcConn));
+                    rpc_conn_init(conns[slot], s);
+                    if (slot >= n_clients) n_clients = slot + 1;
+                    if (!first_connected) {
+                        fprintf(stderr, "flowto: shim connected\n");
+                        first_connected = 1;
+                    } else {
+                        fprintf(stderr, "flowto: sync-helper connected\n");
+                    }
+                } else {
+                    sock_close(s);
+                }
+            }
+        }
+        /* Handle each client that has data */
+        for (int i = 0; i < n_clients; i++) {
+            if (clients[i] == SOCK_INVALID) continue;
+            if (!FD_ISSET(clients[i], &rfds)) continue;
+            int n = 0;
+            char *req = rpc_read_line(conns[i], &n);
+            if (!req || n <= 0) {
+                rpc_conn_free(conns[i]); free(conns[i]); conns[i] = NULL;
+                sock_close(clients[i]); clients[i] = SOCK_INVALID;
+                continue;
+            }
+            flowto_dispatch(clients[i], req);
+        }
+        /* Compact trailing empty slots */
+        while (n_clients > 0 && clients[n_clients - 1] == SOCK_INVALID) n_clients--;
     }
-    rpc_conn_free(&conn);
-    sock_close(shim);
+    for (int i = 0; i < n_clients; i++) {
+        if (clients[i] != SOCK_INVALID) sock_close(clients[i]);
+        if (conns[i]) { rpc_conn_free(conns[i]); free(conns[i]); }
+    }
     fprintf(stderr, "flowto: shim disconnected\n");
 }
 
@@ -939,7 +1044,7 @@ static sock_t flowto_bind_gateway(int *out_port) {
     if (bind(srv, (struct sockaddr*)&sa, sizeof(sa)) < 0) { *out_port = 0; return SOCK_INVALID; }
     int alen = sizeof(sa);
     if (getsockname(srv, (struct sockaddr*)&sa, (void*)&alen) < 0) { *out_port = 0; sock_close(srv); return SOCK_INVALID; }
-    listen(srv, 1);
+    listen(srv, 8);
     *out_port = ntohs(sa.sin_port);
     return srv;
 }
