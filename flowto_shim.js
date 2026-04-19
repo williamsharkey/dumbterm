@@ -137,6 +137,41 @@ function shouldRunLocal(cmd) {
     return false;
 }
 
+// Parse a leading `FLOWTO_HOST=name` env-var prefix. Lets the LLM pin a
+// single Bash call to a specific host (usually "local" for Mac-native work
+// like `go build` or native profiling) while the rest of the session still
+// flows to the remote host. Returns {host, cmd} or null.
+// Handles three forms:
+//   1. Bare:      `FLOWTO_HOST=local cmd ...`
+//   2. Inside Claude's Bash-tool wrapping:
+//        `source snap && setopt ... && eval 'FLOWTO_HOST=local cmd' < /dev/null`
+//      — we peek inside the eval arg.
+//   3. Same but eval '' is double-quoted (rare but possible).
+function parseFlowtoHostPrefix(cmd) {
+    if (typeof cmd !== 'string') return null;
+    let m = cmd.match(/^\s*FLOWTO_HOST=([A-Za-z0-9_.-]+)\s+([\s\S]+)$/);
+    if (m) return { host: m[1], cmd: m[2] };
+    // Look inside the first `eval '...'` or `eval "..."`.
+    const evalM = cmd.match(/\beval\s+(['"])([\s\S]*?)\1/);
+    if (evalM) {
+        const quote = evalM[1];
+        const inner = evalM[2];
+        const m2 = inner.match(/^\s*FLOWTO_HOST=([A-Za-z0-9_.-]+)\s+([\s\S]+)$/);
+        if (m2) {
+            const stripped = m2[2];
+            // Rewrite: replace original eval arg with the FLOWTO_HOST-stripped form
+            // so the surrounding prologue (source snapshot, setopt, stdin redirect)
+            // is preserved. Escape the single-quote case using bash's '\''-join trick.
+            let safe;
+            if (quote === "'") safe = "eval '" + stripped.replace(/'/g, "'\\''") + "'";
+            else               safe = 'eval "' + stripped.replace(/"/g,  '\\"') + '"';
+            const rewritten = cmd.replace(evalM[0], safe);
+            return { host: m2[1], cmd: rewritten };
+        }
+    }
+    return null;
+}
+
 // commandMap: rewrite the first token of a remote-bound command.
 // Claude Code's Bash tool often invokes absolute POSIX paths like /bin/bash
 // or /bin/zsh that don't exist on W7; this rewrites them to the MSYS bash
@@ -507,10 +542,37 @@ child_process.spawn = function (cmd, args, options) {
     }
 
     let useHost = meta.oneShotHost || activeHost;
-    const useCmd = meta.oneShotCmd || (args.length ? cmd + ' ' + args.join(' ') : cmd);
+    let useCmd = meta.oneShotCmd || (args.length ? cmd + ' ' + args.join(' ') : cmd);
     if (!meta.oneShotHost && shouldRunLocal(useCmd)) useHost = 'local';
 
+    // Shell-wrapped invocation (/bin/zsh -c SCRIPT). Unwrap first so the
+    // FLOWTO_HOST= prefix is visible and the route decision matches what the
+    // LLM wrote inside the -c script.
+    const sdc = detectShellDashC(cmd, args);
+    let sdcScript = sdc ? sdc.script : null;
+    const hostPrefix = parseFlowtoHostPrefix(sdcScript || useCmd);
+    if (hostPrefix) {
+        if (hostPrefix.host === 'local' || hosts[hostPrefix.host]) {
+            useHost = hostPrefix.host;
+            if (sdcScript) sdcScript = hostPrefix.cmd;
+            else useCmd = hostPrefix.cmd;
+            TRACE('FLOWTO_HOST_PREFIX', { host: useHost, cmd: (sdcScript || useCmd).slice(0, 120) });
+        } else {
+            TRACE('FLOWTO_HOST_UNKNOWN', { host: hostPrefix.host });
+        }
+    }
+
     if (useHost === 'local') {
+        // If we unwrapped a shell -c and pinned to local, re-wrap for local
+        // execution so the script runs through the original shell.
+        if (sdc && sdcScript !== sdc.script) {
+            return origSpawn.call(this, cmd, [args[0], sdcScript], options);
+        }
+        if (hostPrefix && !sdc) {
+            // Direct invocation had FLOWTO_HOST= prefix; strip and rebuild argv.
+            const parts = useCmd.trim().split(/\s+/);
+            return origSpawn.call(this, parts[0], parts.slice(1), options);
+        }
         if (VIRTUAL_PLATFORM_ENABLED) {
             const savedPlatformDesc = Object.getOwnPropertyDescriptor(process, 'platform');
             Object.defineProperty(process, 'platform', { value: realPlatform, configurable: true });
@@ -520,12 +582,8 @@ child_process.spawn = function (cmd, args, options) {
         return origSpawn.call(this, cmd, args, options);
     }
 
-    // Special-case shell-wrapped invocations. Claude Code's Bash tool uses
-    // /bin/zsh -c "SCRIPT". Route SCRIPT through MSYS bash directly so the
-    // agent doesn't wrap in cmd.exe (which can't parse bash syntax).
-    const sdc = detectShellDashC(cmd, args);
     if (sdc) {
-        return makeRemoteChild(sdc.script, Object.assign({}, options, { __flowtoShell: sdc.shell, __flowtoHost: useHost }));
+        return makeRemoteChild(sdcScript, Object.assign({}, options, { __flowtoShell: sdc.shell, __flowtoHost: useHost }));
     }
     return makeRemoteChild(useCmd, Object.assign({}, options, { __flowtoHost: useHost }));
 };
@@ -545,8 +603,17 @@ child_process.exec = function (command, options, callback) {
         return; // no ChildProcess object returned — callers that expect one will need Phase 2
     }
 
-    const useHost = meta.oneShotHost || activeHost;
-    const useCmd = meta.oneShotCmd || command;
+    let useHost = meta.oneShotHost || activeHost;
+    let useCmd = meta.oneShotCmd || command;
+
+    const hostPrefix = parseFlowtoHostPrefix(useCmd);
+    if (hostPrefix) {
+        if (hostPrefix.host === 'local' || hosts[hostPrefix.host]) {
+            useHost = hostPrefix.host;
+            useCmd = hostPrefix.cmd;
+            TRACE('FLOWTO_HOST_PREFIX_EXEC', { host: useHost, cmd: useCmd.slice(0, 120) });
+        }
+    }
 
     if (useHost === 'local') {
         if (VIRTUAL_PLATFORM_ENABLED) {
