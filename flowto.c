@@ -850,15 +850,39 @@ static int flowto_run_agent(const char *addr) {
         }
         for (int i = 0; i < ncls; i++) {
             if (cls[i] == SOCK_INVALID || !FD_ISSET(cls[i], &rfds)) continue;
+            /* Drain all complete lines from this client's buffer. A single
+               select fire can correspond to many buffered requests; processing
+               one per iteration starves clients that pipeline (e.g. 50
+               parallel stat calls). First read consumes from recv, subsequent
+               reads hit the RpcConn's internal buffer until empty. */
             int n = 0;
             char *req = rpc_read_line(cns[i], &n);
+            int closed = 0;
             if (!req || n <= 0) {
+                closed = 1;
+            } else {
+                agent_handle_request(cls[i], req);
+                /* Drain any more complete lines already buffered, without
+                   blocking on recv(). Peek AFTER the just-returned line
+                   (which rpc_read_line hasn't consumed yet — it does that
+                   at the start of the next call). */
+                while (1) {
+                    int start = cns[i]->last_line_len + 1;
+                    int have_nl = 0;
+                    for (int k = start; k < cns[i]->used; k++) {
+                        if (cns[i]->buf[k] == '\n') { have_nl = 1; break; }
+                    }
+                    if (!have_nl) break;
+                    req = rpc_read_line(cns[i], &n);
+                    if (!req || n <= 0) { closed = 1; break; }
+                    agent_handle_request(cls[i], req);
+                }
+            }
+            if (closed) {
                 rpc_conn_free(cns[i]); free(cns[i]); cns[i] = NULL;
                 sock_close(cls[i]); cls[i] = SOCK_INVALID;
                 fprintf(stderr, "flowto agent: client disconnected (slot %d)\n", i);
-                continue;
             }
-            agent_handle_request(cls[i], req);
         }
         while (ncls > 0 && cls[ncls - 1] == SOCK_INVALID) ncls--;
     }
@@ -1009,18 +1033,34 @@ static void flowto_run_gateway(sock_t gateway) {
                 }
             }
         }
-        /* Handle each client that has data */
+        /* Handle each client that has data. Drain all buffered lines per
+           client so pipelined requests (e.g. 50 parallel stats) don't wait
+           a full select cycle between each one. */
         for (int i = 0; i < n_clients; i++) {
             if (clients[i] == SOCK_INVALID) continue;
             if (!FD_ISSET(clients[i], &rfds)) continue;
             int n = 0;
             char *req = rpc_read_line(conns[i], &n);
+            int closed = 0;
             if (!req || n <= 0) {
+                closed = 1;
+            } else {
+                flowto_dispatch(clients[i], req);
+                while (1) {
+                    int start = conns[i]->last_line_len + 1;
+                    int have_nl = 0;
+                    for (int k = start; k < conns[i]->used; k++)
+                        if (conns[i]->buf[k] == '\n') { have_nl = 1; break; }
+                    if (!have_nl) break;
+                    req = rpc_read_line(conns[i], &n);
+                    if (!req || n <= 0) { closed = 1; break; }
+                    flowto_dispatch(clients[i], req);
+                }
+            }
+            if (closed) {
                 rpc_conn_free(conns[i]); free(conns[i]); conns[i] = NULL;
                 sock_close(clients[i]); clients[i] = SOCK_INVALID;
-                continue;
             }
-            flowto_dispatch(clients[i], req);
         }
         /* Compact trailing empty slots */
         while (n_clients > 0 && clients[n_clients - 1] == SOCK_INVALID) n_clients--;
