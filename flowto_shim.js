@@ -709,28 +709,164 @@ function rpcToHost(host, req, cb) {
     return true;
 }
 
-// Sync variants: intercept so sentinel & pathMap routing works for readFileSync too.
-// Claude Code's Bash tool reads /tmp/claude-XXXX-cwd synchronously after a spawn;
-// without this wrapper it goes straight to Mac's local /tmp and ENOENTs.
+// ── Sync RPC via helper process ──────────────────────────────
+// Node's event loop can't do sync TCP, so we spawn a short-lived helper
+// via execFileSync (which blocks the parent until the child exits) that
+// does the RPC and prints the response JSON to stdout. ~30-50ms overhead
+// per sync call — fine for Claude's occasional readFileSync/statSync/
+// writeFileSync/mkdirSync but terrible in a hot loop (don't use for
+// traversal — rely on async readdir for that).
+const _cpSync = require('child_process');
+const _syncHelperPath = require('path').join(__dirname, 'flowto_sync_helper.js');
+
+// Sync routing: never use VIRTUAL_FS_AGGRESSIVE for sync ops. Node's module
+// loader, Claude Code's local config readers, and many libraries hit
+// readFileSync/statSync every few ms — forcing those to remote would
+// cripple performance and break module loading for tools whose .js files
+// live only on Mac. Sync ops only route remote when explicit pathMap
+// / cloud / sentinel rules match.
+function routeForPathSync(p) {
+    if (isCloudPath(p)) return PERSISTENT_HOST;
+    if (isClaudeSentinel(p) && lastRemoteSpawnHost) return lastRemoteSpawnHost;
+    if (PATH_TRANSLATE_ENABLED && pathMap.length && typeof p === 'string') {
+        for (const [local, remote] of pathMap) {
+            if (p.startsWith(local) || p.startsWith(remote)) return activeHost;
+        }
+    }
+    return 'local';
+}
+function rpcSync(req) {
+    if (!process.env.DUMBTERM_GATEWAY) throw new Error('flowto: no gateway');
+    const reqLine = JSON.stringify(req);
+    TRACE('RPC_SYNC', { op: req.op, path: req.path, host: req.host });
+    try {
+        const out = _cpSync.execFileSync(process.execPath, [_syncHelperPath], {
+            input: reqLine,
+            env: process.env,
+            encoding: 'utf8',
+            timeout: 40000,
+            maxBuffer: 64 * 1024 * 1024,
+            stdio: ['pipe', 'pipe', 'inherit'],
+        });
+        const line = out.split('\n')[0];
+        return JSON.parse(line);
+    } catch (e) {
+        TRACE('RPC_SYNC_FAIL', { op: req.op, err: e.message });
+        return { ok: false, errno: 'EIO', err: 'helper: ' + e.message };
+    }
+}
+function enoentFor(p) { const e = new Error('ENOENT'); e.code = 'ENOENT'; e.errno = -2; e.path = p; e.syscall = 'open'; return e; }
+function syscallError(code, p, syscall) {
+    const e = new Error(code + ': ' + (syscall || 'op')); e.code = code; e.path = p; e.syscall = syscall || 'op'; return e;
+}
+
+// readFileSync — Claude's Write tool reads the existing file via iC() to
+// detect changes. Must route through pathMap to W7, not Mac's local fs.
 const origReadFileSync = fs.readFileSync;
 fs.readFileSync = function (path, opts) {
-    const host = routeForPath(path);
+    const host = routeForPathSync(path);
     TRACE('READFILESYNC', { path, host });
     if (host === 'local') return origReadFileSync.call(this, path, opts);
-    // Remote sync read: must block. Use Atomics.wait via a worker thread or
-    // fall back to best-effort by making the call async + busy-waiting is
-    // not safe. Simplest: use child_process.execFileSync to block via a
-    // helper one-liner that does the TCP read. For now we use a synchronous
-    // trick: deasync-style event loop pump isn't in Node core, so we settle
-    // for origReadFileSync on the LOCAL path and let Claude see ENOENT —
-    // which at least tells Claude "sentinel missing" and it falls back to
-    // not tracking cwd (its Bash tool still returns stdout normally).
-    return origReadFileSync.call(this, path, opts);
+    const remotePath = translateForHost(path, host);
+    const resp = rpcSync({ op: 'read', host, path: remotePath });
+    if (!resp.ok) throw enoentFor(path);
+    const buf = Buffer.from(resp.data || '', 'base64');
+    if (opts === 'utf8' || (opts && opts.encoding === 'utf8')) return buf.toString('utf8');
+    if (typeof opts === 'string') return buf.toString(opts);
+    if (opts && opts.encoding) return buf.toString(opts.encoding);
+    return buf;
 };
+
+// statSync — Write tool calls this to check existence. Must return ENOENT
+// for non-existent remote files so Claude's try/catch sets J=null and
+// proceeds to create. Also used by Av() for mtime comparison.
 const origStatSync = fs.statSync;
 fs.statSync = function (path, opts) {
-    TRACE('STATSYNC', { path, host: routeForPath(path) });
-    return origStatSync.call(this, path, opts);
+    const host = routeForPathSync(path);
+    TRACE('STATSYNC', { path, host });
+    if (host === 'local') return origStatSync.call(this, path, opts);
+    const remotePath = translateForHost(path, host);
+    const resp = rpcSync({ op: 'stat', host, path: remotePath });
+    if (!resp.ok) {
+        TRACE('STATSYNC_FAIL', { path, remotePath, resp });
+        if (opts && opts.throwIfNoEntry === false) return undefined;
+        throw enoentFor(path);
+    }
+    return {
+        size: resp.size,
+        mtime: new Date(resp.mtime * 1000), mtimeMs: resp.mtime * 1000,
+        atime: new Date(resp.mtime * 1000), atimeMs: resp.mtime * 1000,
+        ctime: new Date(resp.mtime * 1000), ctimeMs: resp.mtime * 1000,
+        birthtime: new Date(resp.mtime * 1000), birthtimeMs: resp.mtime * 1000,
+        isDirectory: () => !!resp.isDir, isFile: () => !resp.isDir,
+        isSymbolicLink: () => false, isBlockDevice: () => false,
+        isCharacterDevice: () => false, isFIFO: () => false, isSocket: () => false,
+        mode: resp.mode || 0, uid: 0, gid: 0, dev: 0, ino: 0, nlink: 1, rdev: 0,
+        blocks: 0, blksize: 4096,
+    };
+};
+
+// writeFileSync — the actual write Claude's Write tool performs.
+const origWriteFileSync = fs.writeFileSync;
+fs.writeFileSync = function (path, data, opts) {
+    const host = routeForPathSync(path);
+    TRACE('WRITEFILESYNC', { path, host, len: data && data.length });
+    if (host === 'local') return origWriteFileSync.call(this, path, data, opts);
+    const remotePath = translateForHost(path, host);
+    const buf = Buffer.isBuffer(data) ? data : Buffer.from(String(data), (opts && opts.encoding) || 'utf8');
+    const resp = rpcSync({ op: 'write', host, path: remotePath, data: buf.toString('base64') });
+    if (!resp.ok) throw syscallError(resp.errno || 'EIO', path, 'write');
+    return undefined;
+};
+
+// mkdirSync — parent-dir creation. Must silently succeed on EEXIST if
+// {recursive: true}. Claude's V8().mkdir wrapper likely already retries.
+const origMkdirSync = fs.mkdirSync;
+fs.mkdirSync = function (path, opts) {
+    const host = routeForPathSync(path);
+    TRACE('MKDIRSYNC', { path, host, opts });
+    if (host === 'local') return origMkdirSync.call(this, path, opts);
+    const remotePath = translateForHost(path, host);
+    const recursive = opts && (opts === true || opts.recursive === true);
+    const resp = rpcSync({ op: 'mkdir', host, path: remotePath });
+    if (!resp.ok) {
+        if (recursive && resp.errno === 'EEXIST') return undefined;
+        throw syscallError(resp.errno || 'EIO', path, 'mkdir');
+    }
+    return undefined;
+};
+
+// readdirSync + accessSync: handy for tools that enumerate before writing.
+const origReaddirSync = fs.readdirSync;
+fs.readdirSync = function (path, opts) {
+    const host = routeForPathSync(path);
+    TRACE('READDIRSYNC', { path, host });
+    if (host === 'local') return origReaddirSync.call(this, path, opts);
+    const remotePath = translateForHost(path, host);
+    const resp = rpcSync({ op: 'readdir', host, path: remotePath });
+    if (!resp.ok) throw enoentFor(path);
+    return resp.entries || [];
+};
+
+const origAccessSync = fs.accessSync;
+fs.accessSync = function (path, mode) {
+    const host = routeForPathSync(path);
+    TRACE('ACCESSSYNC', { path, host });
+    if (host === 'local') return origAccessSync.call(this, path, mode);
+    // Access = stat-and-check-exists for our purposes.
+    const remotePath = translateForHost(path, host);
+    const resp = rpcSync({ op: 'stat', host, path: remotePath });
+    if (!resp.ok) throw enoentFor(path);
+    return undefined;
+};
+
+// existsSync — derived from access. Must never throw.
+const origExistsSync = fs.existsSync;
+fs.existsSync = function (path) {
+    const host = routeForPathSync(path);
+    TRACE('EXISTSSYNC', { path, host });
+    if (host === 'local') return origExistsSync.call(this, path);
+    try { fs.accessSync(path); return true; } catch (e) { return false; }
 };
 
 // fs.readFile(path, [opts], cb)
@@ -830,6 +966,37 @@ fs.unlink = function (path, cb) {
         if (!resp.ok) { const e = new Error(resp.errno || 'EIO'); e.code = resp.errno || 'EIO'; return cb && cb(e); }
         cb && cb(null);
     });
+};
+
+// fs.rename — atomic-write pattern (Claude's Write tool writes to foo.tmp,
+// then renames to foo). Without remote rename support the .tmp sidecar
+// lingers forever on W7.
+const origRename = fs.rename;
+fs.rename = function (from, to, cb) {
+    const hostFrom = routeForPath(from);
+    const hostTo = routeForPath(to);
+    if (hostFrom === 'local' && hostTo === 'local') return origRename.call(this, from, to, cb);
+    if (hostFrom !== hostTo) return cb && cb(Object.assign(new Error('EXDEV: cross-host rename not supported'), { code: 'EXDEV' }));
+    const rFrom = translateForHost(from, hostFrom);
+    const rTo   = translateForHost(to, hostTo);
+    rpcCall({ op: 'rename', host: hostFrom, from: rFrom, to: rTo }, (err, resp) => {
+        if (err) return cb && cb(err);
+        if (!resp.ok) { const e = new Error(resp.errno || 'EIO'); e.code = resp.errno || 'EIO'; return cb && cb(e); }
+        cb && cb(null);
+    });
+};
+
+const origRenameSync = fs.renameSync;
+fs.renameSync = function (from, to) {
+    const hostFrom = routeForPathSync(from);
+    const hostTo = routeForPathSync(to);
+    if (hostFrom === 'local' && hostTo === 'local') return origRenameSync.call(this, from, to);
+    if (hostFrom !== hostTo) throw syscallError('EXDEV', from, 'rename');
+    const rFrom = translateForHost(from, hostFrom);
+    const rTo   = translateForHost(to, hostTo);
+    const resp = rpcSync({ op: 'rename', host: hostFrom, from: rFrom, to: rTo });
+    if (!resp.ok) throw syscallError(resp.errno || 'EIO', from, 'rename');
+    return undefined;
 };
 
 // fs.mkdir

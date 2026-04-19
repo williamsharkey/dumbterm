@@ -754,6 +754,20 @@ static void agent_handle_request(sock_t s, const char *req) {
                       id, (errno == ENOENT ? "ENOENT" : "EIO"));
         rpc_write_line(s, msg);
         free(path);
+    } else if (strcmp(op, "rename") == 0) {
+        char *from = json_str(req, "from");
+        char *to   = json_str(req, "to");
+        int rc = (from && to) ? rename(from, to) : -1;
+        const char *ecode = "EIO";
+        if (errno == ENOENT) ecode = "ENOENT";
+        else if (errno == EEXIST) ecode = "EEXIST";
+        else if (errno == EACCES) ecode = "EACCES";
+        else if (errno == ENOTDIR) ecode = "ENOTDIR";
+        char msg[256];
+        if (rc == 0) snprintf(msg, sizeof(msg), "{\"id\":%d,\"ok\":true}", id);
+        else snprintf(msg, sizeof(msg), "{\"id\":%d,\"ok\":false,\"errno\":\"%s\"}", id, ecode);
+        rpc_write_line(s, msg);
+        free(from); free(to);
     } else if (strcmp(op, "mkdir") == 0) {
         char *path = json_str(req, "path");
 #ifdef _WIN32
