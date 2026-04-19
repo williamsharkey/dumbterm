@@ -101,6 +101,57 @@ if (projectCfg.remoteCwd && hosts[defaultRemote]) hosts[defaultRemote].cwd = pro
 if (projectCfg.remoteShell && hosts[defaultRemote]) hosts[defaultRemote].shell = projectCfg.remoteShell;
 if (projectCfg.defaultHost) activeHost = projectCfg.defaultHost;
 
+// ── Session persistence: preserve activeHost + per-host cwd across shim
+// restarts so a dropped/reconnected Claude session picks up where it left
+// off. Keyed on the launch cwd (one state file per project). 7-day TTL.
+const SESSION_PERSIST_ENABLED = process.env.DUMBTERM_SESSION_PERSIST !== '0';
+const _crypto = require('crypto');
+const _sessionHash = _crypto.createHash('sha1').update(origProcess.cwd()).digest('hex').slice(0, 12);
+const SESSION_STATE_PATH = process.env.DUMBTERM_SESSION_STATE
+    || `/tmp/flowto-session-${_sessionHash}.json`;
+const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+function loadSession() {
+    if (!SESSION_PERSIST_ENABLED) return;
+    try {
+        const raw = require('fs').readFileSync(SESSION_STATE_PATH, 'utf8');
+        const s = JSON.parse(raw);
+        if (!s || typeof s !== 'object') return;
+        if (s.savedAt && Date.now() - s.savedAt > SESSION_TTL_MS) return;
+        if (s.activeHost && (s.activeHost === 'local' || hosts[s.activeHost])) {
+            activeHost = s.activeHost;
+        }
+        if (s.hostCwds && typeof s.hostCwds === 'object') {
+            for (const name of Object.keys(s.hostCwds)) {
+                if (hosts[name] && typeof s.hostCwds[name] === 'string') {
+                    hosts[name].cwd = s.hostCwds[name];
+                }
+            }
+        }
+        process.stderr.write(`flowto: resumed session from ${SESSION_STATE_PATH} (active=${activeHost})\n`);
+    } catch (e) { /* no prior state, or unreadable — fine */ }
+}
+
+let _persistTimer = null;
+function persistSession() {
+    if (!SESSION_PERSIST_ENABLED) return;
+    if (_persistTimer) return;
+    _persistTimer = setTimeout(() => {
+        _persistTimer = null;
+        try {
+            const hostCwds = {};
+            for (const name of Object.keys(hosts)) {
+                if (hosts[name].cwd) hostCwds[name] = hosts[name].cwd;
+            }
+            const state = { activeHost, hostCwds, savedAt: Date.now(), projectCwd: process.cwd() };
+            require('fs').writeFileSync(SESSION_STATE_PATH, JSON.stringify(state, null, 2), 'utf8');
+        } catch (e) { /* non-fatal */ }
+    }, 200);
+    _persistTimer.unref && _persistTimer.unref();
+}
+
+loadSession();
+
 // pathMap: [[localPrefix, remotePrefix], ...]
 const pathMap = Array.isArray(projectCfg.pathMap) ? projectCfg.pathMap : [];
 
@@ -339,9 +390,55 @@ function refreshHostInfo(hostName, cb) {
     });
 }
 
-// ── Intercept dumbterm-host / dumbterm-at meta commands ──────
-function maybeMetaCommand(cmd) {
-    const m = cmd.trim().match(/^dumbterm-host\s+(\S+)(?:\s|$)/);
+// Unwrap Claude's /bin/zsh -c prologue to find a user meta command buried
+// inside `eval '...'`. Returns the inner command or null. Keeps the meta
+// detection working even though Claude wraps every Bash call.
+function unwrapEvalCmd(cmd) {
+    if (typeof cmd !== 'string') return null;
+    // Quoted form: eval '...' or eval "..."
+    let m = cmd.match(/\beval\s+(['"])([\s\S]*?)\1/);
+    if (m) return m[2].trim();
+    // Unquoted form (short commands): eval WORD (args?) — terminate at &&, ||, ;, or < /dev
+    m = cmd.match(/\beval\s+([^\s'"<][^<&|;]*?)(?:\s*(?:<\s*\/dev|&&|\|\||;|$))/);
+    if (m) return m[1].trim();
+    return null;
+}
+
+// Extract a plausible user command from a spawn invocation. Spawn can be
+// either a joined command string OR cmd + args where args may be a shell -c
+// script. Claude's Bash tool always uses the latter: spawn('/bin/zsh',
+// ['-c', 'source snap && eval \'USER_CMD\' < /dev/null']).
+function userCmdFromSpawn(cmd, args) {
+    // Direct string command.
+    if (!Array.isArray(args) || args.length === 0) return cmd;
+    // Shell invoker: look inside args for eval '...', else args[1].
+    if (SHELL_INVOKERS.has(cmd) && args[0] === '-c' && args[1]) {
+        const inner = unwrapEvalCmd(args[1]);
+        return (inner || args[1]).trim();
+    }
+    // Other: join.
+    return (cmd + ' ' + args.join(' ')).trim();
+}
+
+// ── Intercept dumbterm-host / dumbterm-at / dumbterm-status / dumbterm-clipboard
+// `probeOverride` lets spawn pass the already-extracted user command; exec
+// callers pass the joined command directly.
+function maybeMetaCommand(cmd, probeOverride) {
+    let probe = probeOverride || (unwrapEvalCmd(cmd) || (typeof cmd === 'string' ? cmd.trim() : ''));
+    // Strip a leading FLOWTO_HOST=name prefix so `FLOWTO_HOST=local dumbterm-*`
+    // still hits the meta dispatcher. The host-routing side is handled
+    // separately by parseFlowtoHostPrefix + the activeHost override, but for
+    // metas we want to intercept *before* shelling out.
+    let metaHostOverride = null;
+    const hp = probe.match(/^\s*FLOWTO_HOST=([A-Za-z0-9_.-]+)\s+([\s\S]+)$/);
+    if (hp && (hp[1] === 'local' || hosts[hp[1]])) {
+        metaHostOverride = hp[1];
+        probe = hp[2];
+    }
+    // Pass metaHostOverride into the returned meta so async handlers can
+    // use it instead of activeHost.
+    function tag(m) { if (m.handled && metaHostOverride) m.hostOverride = metaHostOverride; return m; }
+    const m = probe.match(/^dumbterm-host\s+(\S+)(?:\s|$)/);
     if (m) {
         const name = m[1];
         if (name === 'list') {
@@ -349,15 +446,106 @@ function maybeMetaCommand(cmd) {
         }
         if (hosts[name]) {
             activeHost = name;
+            persistSession();
             return { handled: true, out: `active host: ${name}\n`, err: '', exit: 0 };
         }
         return { handled: true, out: '', err: `unknown host: ${name}\n`, exit: 1 };
     }
-    const m2 = cmd.trim().match(/^dumbterm-at\s+(\S+)\s+(.+)$/);
+    const m2 = probe.match(/^dumbterm-at\s+(\S+)\s+(.+)$/);
     if (m2) {
         return { handled: false, oneShotHost: m2[1], oneShotCmd: m2[2] };
     }
+    if (/^dumbterm-status(\s|$)/.test(probe)) {
+        return tag({ handled: true, async: 'status' });
+    }
+    const mc = probe.match(/^dumbterm-clipboard\s+(get|set)(?:\s+([\s\S]+))?$/);
+    if (mc) {
+        // Strip optional surrounding quotes from the set payload — bash
+        // wouldn't actually pass them to a real binary, but since we parse
+        // the literal script here, we need to do it ourselves.
+        let data = mc[2] || '';
+        const q = data.match(/^(['"])([\s\S]*)\1$/);
+        if (q) data = q[2];
+        return tag({ handled: true, async: 'clipboard', action: mc[1], data });
+    }
     return { handled: false };
+}
+
+// Async meta handlers. Return a promise of {out, err, exit}.
+function runAsyncMeta(meta) {
+    return new Promise((resolve) => {
+        if (meta.async === 'status') {
+            const t0 = Date.now();
+            const host = meta.hostOverride || activeHost;
+            rpcCall({ op: 'ping', host }, (err, resp) => {
+                const rtt = Date.now() - t0;
+                if (err || !resp.ok) {
+                    return resolve({ out: '', err: `ping ${host} failed: ${err ? err.message : 'no ok'}\n`, exit: 1 });
+                }
+                const cwdInfo = [];
+                for (const name of Object.keys(hosts)) {
+                    const h = hosts[name];
+                    cwdInfo.push(`  ${name === activeHost ? '*' : ' '} ${name}: cwd=${h.cwd || '(unset)'} platform=${h.platform || '?'}`);
+                }
+                const uptimeS = resp.uptime || 0;
+                const up = uptimeS >= 3600
+                    ? `${Math.floor(uptimeS/3600)}h${Math.floor((uptimeS%3600)/60)}m`
+                    : uptimeS >= 60
+                        ? `${Math.floor(uptimeS/60)}m${uptimeS%60}s`
+                        : `${uptimeS}s`;
+                const out =
+                    `flowto status\n` +
+                    `  gateway: ${gwHost}:${gwPort}\n` +
+                    `  active:  ${host} (pid ${resp.pid} on ${resp.host}, up ${up})\n` +
+                    `  rtt:     ${rtt} ms\n` +
+                    `  hosts:\n${cwdInfo.join('\n')}\n`;
+                resolve({ out, err: '', exit: 0 });
+            });
+            return;
+        }
+        if (meta.async === 'clipboard') {
+            const host = meta.hostOverride || activeHost;
+            // On local host, shell out to pbcopy/pbpaste directly instead of RPCing.
+            if (host === 'local') {
+                const cp = require('child_process');
+                if (meta.action === 'get') {
+                    origExec.call(cp, 'pbpaste', { maxBuffer: 10 * 1024 * 1024 }, (err, stdout) => {
+                        if (err) return resolve({ out: '', err: `pbpaste failed: ${err.message}\n`, exit: 1 });
+                        resolve({ out: stdout || '', err: '', exit: 0 });
+                    });
+                } else {
+                    const payload = meta.data || '';
+                    const child = origSpawn.call(cp, 'pbcopy');
+                    child.stdin.end(payload);
+                    child.on('exit', (code) => {
+                        if (code === 0) resolve({ out: `clipboard set (${payload.length} bytes, local)\n`, err: '', exit: 0 });
+                        else resolve({ out: '', err: `pbcopy exit ${code}\n`, exit: 1 });
+                    });
+                }
+                return;
+            }
+            if (meta.action === 'get') {
+                rpcCall({ op: 'clipboard', host, action: 'get' }, (err, resp) => {
+                    if (err || !resp || !resp.ok) {
+                        return resolve({ out: '', err: `clipboard get failed: ${err ? err.message : resp && resp.err}\n`, exit: 1 });
+                    }
+                    const data = Buffer.from(resp.data || '', 'base64').toString('utf8');
+                    resolve({ out: data, err: '', exit: 0 });
+                });
+            } else {
+                const payload = meta.data || '';
+                const b64 = Buffer.from(payload, 'utf8').toString('base64');
+                rpcCall({ op: 'clipboard', host, action: 'set', data: b64 }, (err, resp) => {
+                    if (err || !resp || !resp.ok) {
+                        return resolve({ out: '', err: `clipboard set failed: ${err ? err.message : resp && resp.err}\n`, exit: 1 });
+                    }
+                    resolve({ out: `clipboard set (${payload.length} bytes, ${host})\n`, err: '', exit: 0 });
+                });
+            }
+            return;
+        }
+        resolve({ out: '', err: `unknown async meta: ${meta.async}\n`, exit: 1 });
+    });
 }
 
 // ── Wrap child_process.spawn ──────────────────────────────────
@@ -523,21 +711,51 @@ child_process.spawn = function (cmd, args, options) {
         cwd: options.cwd,
     });
 
-    const meta = maybeMetaCommand(cmd);
+    const meta = maybeMetaCommand(cmd, userCmdFromSpawn(cmd, args));
     if (meta.handled) {
-        // Build a fake child that emits the meta result
+        // Build a fake child that emits the meta result. If Claude's Bash
+        // tool passed stdio:["pipe", <fd>, <fd>] (fd-dup pattern), the
+        // stream-push path is invisible to the consumer — we also need to
+        // write into the dup'd fds so Claude's reader picks it up.
+        const fsMod = require('fs');
+        let outFd = null, errFd = null;
+        if (Array.isArray(options.stdio)) {
+            const dupFd = (n) => {
+                if (typeof n !== 'number' || n < 0) return null;
+                try { return fsMod.openSync('/dev/fd/' + n, 'a'); } catch (e) { return null; }
+            };
+            outFd = dupFd(options.stdio[1]);
+            errFd = dupFd(options.stdio[2]);
+        }
         const child = new EventEmitter();
         const out = new Readable({ read() {} });
         const err = new Readable({ read() {} });
         child.stdout = out; child.stderr = err;
         child.stdin = new Writable({ write(c,e,cb){cb();} });
-        process.nextTick(() => {
-            if (meta.out) out.push(Buffer.from(meta.out));
-            if (meta.err) err.push(Buffer.from(meta.err));
+        const emit = (result) => {
+            if (result.out) {
+                const b = Buffer.from(result.out);
+                out.push(b);
+                if (outFd != null) { try { fsMod.writeSync(outFd, b); } catch (e) {} }
+            }
+            if (result.err) {
+                const b = Buffer.from(result.err);
+                err.push(b);
+                if (errFd != null) { try { fsMod.writeSync(errFd, b); } catch (e) {} }
+            }
+            if (outFd != null) { try { fsMod.closeSync(outFd); } catch (e) {} }
+            if (errFd != null && errFd !== outFd) { try { fsMod.closeSync(errFd); } catch (e) {} }
             out.push(null); err.push(null);
-            child.emit('exit', meta.exit, null);
-            child.emit('close', meta.exit, null);
-        });
+            setImmediate(() => {
+                child.emit('exit', result.exit, null);
+                child.emit('close', result.exit, null);
+            });
+        };
+        if (meta.async) {
+            runAsyncMeta(meta).then(emit);
+        } else {
+            process.nextTick(() => emit(meta));
+        }
         return child;
     }
 
@@ -597,9 +815,11 @@ child_process.exec = function (command, options, callback) {
 
     const meta = maybeMetaCommand(command);
     if (meta.handled) {
-        if (callback) process.nextTick(() => callback(
-            meta.exit === 0 ? null : Object.assign(new Error(`Exit ${meta.exit}`), { code: meta.exit }),
-            meta.out, meta.err));
+        const deliver = (r) => callback && callback(
+            r.exit === 0 ? null : Object.assign(new Error(`Exit ${r.exit}`), { code: r.exit }),
+            r.out, r.err);
+        if (meta.async) runAsyncMeta(meta).then(deliver);
+        else process.nextTick(() => deliver(meta));
         return; // no ChildProcess object returned — callers that expect one will need Phase 2
     }
 
@@ -1241,8 +1461,9 @@ if (VIRTUAL_CWD_ENABLED) {
     process.chdir = function (path) {
         const h = hosts[activeHost];
         if (!h) throw new Error('unknown host');
-        if (h.kind === 'local') { origProcess.chdir(path); h.cwd = origProcess.cwd(); return; }
+        if (h.kind === 'local') { origProcess.chdir(path); h.cwd = origProcess.cwd(); persistSession(); return; }
         h.cwd = path;
+        persistSession();
     };
 }
 

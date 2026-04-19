@@ -543,6 +543,8 @@ static void agent_spawn_streaming(sock_t s, int id, const char *cmd,
 #endif
 }
 
+static time_t g_agent_start_time = 0;
+
 /* handle one RPC request on the given connection */
 static void agent_handle_request(sock_t s, const char *req) {
     char *op = json_str(req, "op");
@@ -552,8 +554,16 @@ static void agent_handle_request(sock_t s, const char *req) {
     if (strcmp(op, "ping") == 0) {
         char host[256] = "unknown";
         gethostname(host, sizeof(host));
+        long uptime = g_agent_start_time ? (long)(time(NULL) - g_agent_start_time) : 0;
+#ifdef _WIN32
+        int pid = (int)GetCurrentProcessId();
+#else
+        int pid = (int)getpid();
+#endif
         char msg[512];
-        snprintf(msg, sizeof(msg), "{\"id\":%d,\"ok\":true,\"host\":\"%s\"}", id, host);
+        snprintf(msg, sizeof(msg),
+            "{\"id\":%d,\"ok\":true,\"host\":\"%s\",\"pid\":%d,\"uptime\":%ld}",
+            id, host, pid, uptime);
         rpc_write_line(s, msg);
     } else if (strcmp(op, "host_info") == 0) {
         char hostname[256] = "unknown";
@@ -787,6 +797,89 @@ static void agent_handle_request(sock_t s, const char *req) {
         else snprintf(msg, sizeof(msg), "{\"id\":%d,\"ok\":false,\"errno\":\"%s\"}", id, ecode);
         rpc_write_line(s, msg);
         free(from); free(to);
+    } else if (strcmp(op, "clipboard") == 0) {
+        char *action = json_str(req, "action");
+        if (action && strcmp(action, "get") == 0) {
+            unsigned char *text = NULL;
+            int text_len = 0;
+#ifdef _WIN32
+            if (OpenClipboard(NULL)) {
+                HANDLE h = GetClipboardData(CF_UNICODETEXT);
+                if (h) {
+                    LPCWSTR ws = (LPCWSTR)GlobalLock(h);
+                    if (ws) {
+                        int wlen = (int)wcslen(ws);
+                        int need = WideCharToMultiByte(CP_UTF8, 0, ws, wlen, NULL, 0, NULL, NULL);
+                        if (need > 0) {
+                            text = (unsigned char*)malloc(need);
+                            text_len = WideCharToMultiByte(CP_UTF8, 0, ws, wlen, (LPSTR)text, need, NULL, NULL);
+                        }
+                        GlobalUnlock(h);
+                    }
+                }
+                CloseClipboard();
+            }
+#else
+            /* Mac/POSIX: popen pbpaste. Only hit on a Mac-side agent, which
+               isn't the typical flowto setup but kept symmetric. */
+            FILE *f = popen("pbpaste", "r");
+            if (f) {
+                int cap = 4096; text = (unsigned char*)malloc(cap);
+                text_len = 0;
+                int c;
+                while ((c = fgetc(f)) != EOF) {
+                    if (text_len + 1 >= cap) { cap *= 2; text = (unsigned char*)realloc(text, cap); }
+                    text[text_len++] = (unsigned char)c;
+                }
+                pclose(f);
+            }
+#endif
+            char *b64 = b64_encode(text ? text : (unsigned char*)"", text_len);
+            int cap = strlen(b64) + 64; char *msg = (char*)malloc(cap);
+            snprintf(msg, cap, "{\"id\":%d,\"ok\":true,\"data\":\"%s\"}", id, b64);
+            rpc_write_line(s, msg);
+            free(msg); free(b64); if (text) free(text);
+        } else if (action && strcmp(action, "set") == 0) {
+            char *data = json_str(req, "data");
+            int blen = 0;
+            unsigned char *bytes = data ? b64_decode(data, &blen) : NULL;
+            int ok_set = 0;
+#ifdef _WIN32
+            if (bytes && OpenClipboard(NULL)) {
+                EmptyClipboard();
+                int wlen = MultiByteToWideChar(CP_UTF8, 0, (LPCSTR)bytes, blen, NULL, 0);
+                HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, (wlen + 1) * sizeof(WCHAR));
+                if (hg) {
+                    LPWSTR ws = (LPWSTR)GlobalLock(hg);
+                    if (ws) {
+                        MultiByteToWideChar(CP_UTF8, 0, (LPCSTR)bytes, blen, ws, wlen);
+                        ws[wlen] = 0;
+                        GlobalUnlock(hg);
+                        if (SetClipboardData(CF_UNICODETEXT, hg)) ok_set = 1;
+                    }
+                }
+                CloseClipboard();
+            }
+#else
+            if (bytes) {
+                FILE *f = popen("pbcopy", "w");
+                if (f) {
+                    if (fwrite(bytes, 1, blen, f) == (size_t)blen) ok_set = 1;
+                    pclose(f);
+                }
+            }
+#endif
+            char msg[256];
+            if (ok_set) snprintf(msg, sizeof(msg), "{\"id\":%d,\"ok\":true}", id);
+            else        snprintf(msg, sizeof(msg), "{\"id\":%d,\"ok\":false,\"err\":\"clipboard set failed\"}", id);
+            rpc_write_line(s, msg);
+            free(data); if (bytes) free(bytes);
+        } else {
+            char msg[128];
+            snprintf(msg, sizeof(msg), "{\"id\":%d,\"ok\":false,\"err\":\"clipboard: action must be get|set\"}", id);
+            rpc_write_line(s, msg);
+        }
+        free(action);
     } else if (strcmp(op, "mkdir") == 0) {
         char *path = json_str(req, "path");
 #ifdef _WIN32
@@ -818,6 +911,7 @@ static void agent_handle_request(sock_t s, const char *req) {
 
 /* Run as --agent: listen, accept one client, serve RPC forever. */
 static int flowto_run_agent(const char *addr) {
+    g_agent_start_time = time(NULL);
     sock_init();
     /* Run any --on-start commands before binding. Best-effort — log failures. */
     for (int i = 0; i < g_on_start_count; i++) {
